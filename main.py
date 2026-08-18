@@ -6,9 +6,13 @@ from core.report import print_report
 
 from core.trade_logger import save_trade
 
+from sentry_setup import init_sentry
+
 
 
 def main():
+
+    init_sentry()
 
     print()
 

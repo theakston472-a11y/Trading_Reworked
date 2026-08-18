@@ -1,0 +1,2 @@
+-r pipeline/requirements.txt
+sentry-sdk>=2,<3

@@ -26,6 +26,26 @@
 
 The supplied feature database ends on 2026-08-07, so “current” in this project means the latest available candle, not 2026-08-12.
 
+## Optional Sentry error monitoring
+
+Install the project dependencies from the repository root:
+
+```powershell
+python -m pip install -r .\requirements.txt
+```
+
+Sentry is disabled unless `SENTRY_DSN` is set. Configure it in your shell before
+starting the application; do not commit the real value:
+
+```powershell
+$env:SENTRY_DSN = "your-sentry-dsn"
+$env:SENTRY_ENVIRONMENT = "production"
+python .\main.py
+```
+
+`.env.example` documents the available variables. Local `.env` files remain
+ignored by Git and are not loaded automatically.
+
 
 ## Recommended command sequence
 
