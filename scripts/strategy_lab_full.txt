@@ -1,0 +1,2263 @@
+﻿"""
+Strategy Laboratory
+
+Purpose
+-------
+Tests promoted trading strategies across an RR grid.
+
+Features
+--------
+- Tests multiple candidate strategies.
+- Sweeps RR from 1.0 to 7.0 by default.
+- Uses SQLite caching.
+- Supports yearly robustness testing.
+- Handles overlapping trades with a maximum open-trade limit.
+- Rejects zero-trade results.
+- Measures RR stability.
+- Selects only ONE best RR for each unique strategy.
+- Produces final rankings and diagnostic information.
+- Optional trade charts for the final shortlist.
+
+Important
+---------
+The dataframe is RESET after date filtering so that signal indices are
+positional indices. This prevents the zero-trade bug caused by using
+original dataframe indices inside filtered datasets.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# RR GRID
+# ============================================================
+
+def rr_grid(start: float = 1.0,
+            stop: float = 7.0,
+            step: float = 0.1) -> list[float]:
+
+    if step <= 0:
+        raise ValueError("RR step must be greater than zero.")
+
+    if stop < start:
+        raise ValueError("RR stop must be greater than or equal to RR start.")
+
+    count = int(round((stop - start) / step))
+
+    return [
+        round(start + i * step, 1)
+        for i in range(count + 1)
+    ]
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def stable_key(
+    direction: str,
+    session: str,
+    conditions: str,
+    rr: float,
+    period: str,
+    max_bars: int,
+    max_open: int,
+) -> str:
+
+    raw = (
+        f"{direction}|"
+        f"{session}|"
+        f"{conditions}|"
+        f"{rr:.1f}|"
+        f"{period}|"
+        f"{max_bars}|"
+        f"{max_open}"
+    )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
+def init_db(path: str) -> sqlite3.Connection:
+
+    con = sqlite3.connect(path)
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS results(
+            key TEXT PRIMARY KEY,
+            direction TEXT,
+            session TEXT,
+            conditions TEXT,
+            rr REAL,
+            period TEXT,
+            start TEXT,
+            end TEXT,
+            trades INTEGER,
+            wins INTEGER,
+            losses INTEGER,
+            win_rate REAL,
+            profit_factor REAL,
+            net_r REAL,
+            expectancy_r REAL,
+            max_drawdown_r REAL,
+            avg_trades_day REAL,
+            max_concurrent INTEGER,
+            avg_hold_bars REAL,
+            result_json TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    con.commit()
+
+    return con
+
+
+def db_get(
+    con: sqlite3.Connection,
+    key: str,
+):
+
+    row = con.execute(
+        "SELECT * FROM results WHERE key=?",
+        (key,),
+    ).fetchone()
+
+    if row is None:
+        return None
+
+    cols = [
+        r[1]
+        for r in con.execute(
+            "PRAGMA table_info(results)"
+        ).fetchall()
+    ]
+
+    return dict(zip(cols, row))
+
+
+def db_put(
+    con: sqlite3.Connection,
+    row: dict,
+) -> None:
+
+    cols = list(row.keys())
+
+    values = [
+        row[c]
+        for c in cols
+    ]
+
+    placeholders = ",".join(
+        ["?"] * len(cols)
+    )
+
+    con.execute(
+        f"""
+        INSERT OR REPLACE INTO results
+        ({",".join(cols)})
+        VALUES ({placeholders})
+        """,
+        values,
+    )
+
+
+# ============================================================
+# ARGUMENTS
+# ============================================================
+
+def parse_args():
+
+    parser = argparse.ArgumentParser(
+        description="Strategy Laboratory with RR robustness testing."
+    )
+
+    parser.add_argument(
+        "--data",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--candidates",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--db",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--out",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--start",
+        default="2025-01-01",
+    )
+
+    parser.add_argument(
+        "--end",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--rr-start",
+        type=float,
+        default=1.0,
+    )
+
+    parser.add_argument(
+        "--rr-stop",
+        type=float,
+        default=7.0,
+    )
+
+    parser.add_argument(
+        "--rr-step",
+        type=float,
+        default=0.1,
+    )
+
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=100,
+    )
+
+    parser.add_argument(
+        "--all-candidates",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--max-bars",
+        type=int,
+        default=48,
+    )
+
+    parser.add_argument(
+        "--max-open-trades",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
+        "--frequency-target",
+        type=float,
+        default=0.75,
+        help="Trades/day target for full frequency score.",
+    )
+
+    parser.add_argument(
+        "--min-trades",
+        type=int,
+        default=20,
+    )
+
+    parser.add_argument(
+        "--min-trades-per-day",
+        type=float,
+        default=0.0,
+    )
+
+    parser.add_argument(
+        "--final-n",
+        type=int,
+        default=20,
+    )
+
+    parser.add_argument(
+        "--charts",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore SQLite cache and recalculate everything.",
+    )
+
+    return parser.parse_args()
+
+
+# ============================================================
+# DEFAULT PATHS
+# ============================================================
+
+def defaults(args):
+
+    base = Path(__file__).resolve().parents[1]
+
+    args.data = args.data or str(
+        base / "quant" / "feature_database.csv"
+    )
+
+    args.candidates = args.candidates or str(
+        base / "quant" / "top100_candidates.csv"
+    )
+
+    args.db = args.db or str(
+        base / "results" / "strategy_lab.sqlite"
+    )
+
+    args.out = args.out or str(
+        base / "results" / "strategy_lab"
+    )
+
+    Path(args.db).parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    Path(args.out).parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return args
+
+
+# ============================================================
+# DATA LOADING
+# ============================================================
+
+def load_data(path: str) -> pd.DataFrame:
+
+    print(f"Loading data: {path}")
+
+    df = pd.read_csv(path)
+
+    required = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "atr14",
+        "session",
+    ]
+
+    missing = [
+        c
+        for c in required
+        if c not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Feature database is missing required columns: "
+            + ", ".join(missing)
+        )
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+
+    df = (
+        df
+        .dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "atr14",
+    ]:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df["session"] = (
+        df["session"]
+        .astype(str)
+        .str.strip()
+    )
+
+    return df
+
+
+# ============================================================
+# PERIODS
+# ============================================================
+
+def get_periods(
+    df: pd.DataFrame,
+    start,
+    end,
+):
+
+    start_ts = pd.Timestamp(
+        start,
+        tz="UTC",
+    )
+
+    if end:
+        end_ts = pd.Timestamp(
+            end,
+            tz="UTC",
+        )
+    else:
+        end_ts = df["timestamp"].max()
+
+    periods = {
+        "ALL": (
+            start_ts,
+            end_ts,
+        )
+    }
+
+    for year in range(
+        start_ts.year,
+        end_ts.year + 1,
+    ):
+
+        year_start = pd.Timestamp(
+            f"{year}-01-01",
+            tz="UTC",
+        )
+
+        year_end = pd.Timestamp(
+            f"{year}-12-31 23:59:59",
+            tz="UTC",
+        )
+
+        period_start = max(
+            start_ts,
+            year_start,
+        )
+
+        period_end = min(
+            end_ts,
+            year_end,
+        )
+
+        if period_start <= period_end:
+
+            periods[str(year)] = (
+                period_start,
+                period_end,
+            )
+
+    return periods
+
+
+# ============================================================
+# SIGNAL DETECTION
+# ============================================================
+
+def signal_indices(
+    df: pd.DataFrame,
+    direction: str,
+    session: str,
+    conditions: str,
+) -> np.ndarray:
+
+    work = df
+
+    requested_session = str(
+        session
+    ).strip().lower()
+
+    if requested_session not in (
+        "",
+        "all",
+        "nan",
+        "none",
+    ):
+
+        work = work[
+            work["session"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            == requested_session
+        ]
+
+    if work.empty:
+
+        return np.array(
+            [],
+            dtype=np.int64,
+        )
+
+    mask = np.ones(
+        len(work),
+        dtype=bool,
+    )
+
+    condition_list = [
+        x.strip()
+        for x in str(conditions).split("+")
+        if x.strip()
+    ]
+
+    for condition in condition_list:
+
+        if condition not in work.columns:
+
+            return np.array(
+                [],
+                dtype=np.int64,
+            )
+
+        values = work[condition]
+
+        if values.dtype != bool:
+
+            values = (
+                values
+                .fillna(False)
+                .astype(bool)
+            )
+
+        mask &= values.to_numpy()
+
+    positions = np.flatnonzero(mask)
+
+    return positions.astype(
+        np.int64
+    )
+
+
+# ============================================================
+# BACKTEST
+# ============================================================
+
+def backtest(
+    df: pd.DataFrame,
+    indices: np.ndarray,
+    direction: str,
+    rr: float,
+    max_bars: int,
+    max_open: int,
+):
+
+    if len(indices) == 0:
+        return None
+
+    op = df["open"].to_numpy(dtype=float)
+    hi = df["high"].to_numpy(dtype=float)
+    lo = df["low"].to_numpy(dtype=float)
+    cl = df["close"].to_numpy(dtype=float)
+    atr = df["atr14"].to_numpy(dtype=float)
+
+    results = []
+    trades = []
+    active = []
+    max_concurrent = 0
+
+    direction_upper = str(direction).upper()
+
+    for signal_i in indices:
+
+        signal_i = int(signal_i)
+
+        entry_i = signal_i + 1
+
+        if entry_i >= len(df):
+            continue
+
+        active = [
+            exit_i
+            for exit_i in active
+            if exit_i >= entry_i
+        ]
+
+        if len(active) >= max_open:
+            continue
+
+        entry = op[entry_i]
+        atr_value = atr[signal_i]
+
+        candle_distance = abs(
+            hi[signal_i] - lo[signal_i]
+        )
+
+        if np.isfinite(atr_value):
+
+            distance = max(
+                atr_value,
+                candle_distance,
+            )
+
+        else:
+
+            distance = candle_distance
+
+        if (
+            not np.isfinite(distance)
+            or distance <= 0
+            or not np.isfinite(entry)
+        ):
+            continue
+
+        if direction_upper == "SELL":
+
+            sl = entry + distance
+            tp = entry - distance * rr
+
+        else:
+
+            sl = entry - distance
+            tp = entry + distance * rr
+
+        end_i = min(
+            len(df) - 1,
+            entry_i + max_bars - 1,
+        )
+
+        outcome = None
+        exit_i = end_i
+        reason = "TIME"
+
+        for j in range(
+            entry_i,
+            end_i + 1,
+        ):
+
+            if direction_upper == "SELL":
+
+                stop_hit = hi[j] >= sl
+                target_hit = lo[j] <= tp
+
+            else:
+
+                stop_hit = lo[j] <= sl
+                target_hit = hi[j] >= tp
+
+            if stop_hit:
+
+                outcome = -1.0
+                exit_i = j
+                reason = "SL"
+                break
+
+            if target_hit:
+
+                outcome = float(rr)
+                exit_i = j
+                reason = "TP"
+                break
+
+        if outcome is None:
+
+            if direction_upper == "SELL":
+
+                move = entry - cl[exit_i]
+
+            else:
+
+                move = cl[exit_i] - entry
+
+            outcome = float(
+                move / distance
+            )
+
+        results.append(outcome)
+
+        active.append(exit_i)
+
+        max_concurrent = max(
+            max_concurrent,
+            len(active),
+        )
+
+        trades.append(
+            {
+                "signal_i": signal_i,
+                "entry_i": entry_i,
+                "exit_i": int(exit_i),
+                "entry": float(entry),
+                "sl": float(sl),
+                "tp": float(tp),
+                "outcome_r": float(outcome),
+                "reason": reason,
+                "entry_time": str(
+                    df.iloc[entry_i]["timestamp"]
+                ),
+                "exit_time": str(
+                    df.iloc[exit_i]["timestamp"]
+                ),
+            }
+        )
+
+    if not results:
+        return None
+
+    arr = np.asarray(
+        results,
+        dtype=float,
+    )
+
+    wins = arr[arr > 0]
+    losses = arr[arr < 0]
+
+    gross_profit = (
+        float(wins.sum())
+        if len(wins)
+        else 0.0
+    )
+
+    gross_loss = (
+        float(abs(losses.sum()))
+        if len(losses)
+        else 0.0
+    )
+
+    if gross_loss > 0:
+
+        profit_factor = (
+            gross_profit / gross_loss
+        )
+
+    elif gross_profit > 0:
+
+        profit_factor = 999.0
+
+    else:
+
+        profit_factor = 0.0
+
+    equity = np.cumsum(arr)
+
+    running_max = np.maximum.accumulate(
+        np.r_[0.0, equity]
+    )[1:]
+
+    drawdown = (
+        running_max - equity
+    )
+
+    max_drawdown = (
+        float(drawdown.max())
+        if len(drawdown)
+        else 0.0
+    )
+
+    first_time = df["timestamp"].iloc[0]
+    last_time = df["timestamp"].iloc[-1]
+
+    days = max(
+        (
+            last_time - first_time
+        ).total_seconds()
+        / 86400.0,
+        1.0,
+    )
+
+    return {
+        "trades": int(len(arr)),
+        "wins": int(len(wins)),
+        "losses": int(len(losses)),
+        "win_rate": float(
+            len(wins) / len(arr) * 100.0
+        ),
+        "profit_factor": float(
+            profit_factor
+        ),
+        "net_r": float(arr.sum()),
+        "expectancy_r": float(arr.mean()),
+        "max_drawdown_r": float(
+            max_drawdown
+        ),
+        "avg_trades_day": float(
+            len(arr) / days
+        ),
+        "max_concurrent": int(
+            max_concurrent
+        ),
+        "avg_hold_bars": float(
+            np.mean(
+                [
+                    t["exit_i"]
+                    - t["entry_i"]
+                    + 1
+                    for t in trades
+                ]
+            )
+        ),
+        "trades_detail": trades,
+    }
+
+
+# ============================================================
+# SCORE
+# ============================================================
+
+def robust_score(
+    row,
+    min_trades: int,
+    frequency_target: float,
+) -> float:
+
+    trades = float(row["trades"])
+
+    if trades <= 0:
+        return 0.0
+
+    expectancy = float(
+        row["expectancy_r"]
+    )
+
+    profit_factor = float(
+        row["profit_factor"]
+    )
+
+    drawdown = float(
+        row["max_drawdown_r"]
+    )
+
+    frequency = float(
+        row["avg_trades_day"]
+    )
+
+    sample_score = min(
+        trades / max(min_trades, 1),
+        2.0,
+    ) / 2.0
+
+    expectancy_score = max(
+        min(expectancy, 1.0),
+        0.0,
+    )
+
+    pf_score = min(
+        max(profit_factor, 0.0),
+        5.0,
+    ) / 5.0
+
+    drawdown_score = (
+        1.0
+        / (
+            1.0
+            + max(drawdown, 0.0)
+        )
+    )
+
+    frequency_score = min(
+        frequency
+        / max(frequency_target, 1e-9),
+        1.0,
+    )
+
+    score = 100.0 * (
+        0.30 * expectancy_score
+        + 0.20 * pf_score
+        + 0.20 * drawdown_score
+        + 0.15 * frequency_score
+        + 0.15 * sample_score
+    )
+
+    return float(score)
+
+
+# ============================================================
+# CHARTS
+# ============================================================
+
+def save_trade_charts(
+    df: pd.DataFrame,
+    final_df: pd.DataFrame,
+    outdir: str,
+):
+
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    output_dir = Path(outdir)
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    for _, row in final_df.iterrows():
+
+        detail = row.get("_detail")
+
+        if not detail:
+            continue
+
+        for n, trade in enumerate(
+            detail[:2],
+            start=1,
+        ):
+
+            entry_i = int(
+                trade["entry_i"]
+            )
+
+            exit_i = int(
+                trade["exit_i"]
+            )
+
+            # ------------------------------------------------
+            # CHART WINDOW
+            # ------------------------------------------------
+            #
+            # More candles before the entry and after the exit
+            # give better context without making the candles
+            # excessively compressed.
+            #
+            a = max(
+                0,
+                entry_i - 20,
+            )
+
+            b = min(
+                len(df) - 1,
+                exit_i + 14,
+            )
+
+            chart_data = df.iloc[
+                a:b + 1
+            ].copy()
+
+            # ------------------------------------------------
+            # FIGURE SIZE
+            # ------------------------------------------------
+
+            fig, ax = plt.subplots(
+                figsize=(16, 8)
+            )
+
+            # ------------------------------------------------
+            # CANDLE WIDTH
+            # ------------------------------------------------
+
+            candle_width = 0.68
+
+            # ------------------------------------------------
+            # DRAW CANDLES
+            # ------------------------------------------------
+
+            for k, (_, candle) in enumerate(
+                chart_data.iterrows()
+            ):
+
+                open_price = float(
+                    candle["open"]
+                )
+
+                high_price = float(
+                    candle["high"]
+                )
+
+                low_price = float(
+                    candle["low"]
+                )
+
+                close_price = float(
+                    candle["close"]
+                )
+
+                # Wick
+                ax.plot(
+                    [k, k],
+                    [
+                        low_price,
+                        high_price,
+                    ],
+                    linewidth=1.2,
+                )
+
+                # Candle body
+                body_low = min(
+                    open_price,
+                    close_price,
+                )
+
+                body_height = abs(
+                    close_price
+                    - open_price
+                )
+
+                # Make doji bodies visible
+                min_body_height = (
+                    max(
+                        (high_price - low_price)
+                        * 0.015,
+                        1e-8,
+                    )
+                )
+
+                body_height = max(
+                    body_height,
+                    min_body_height,
+                )
+
+                if close_price >= open_price:
+
+                    face_color = "white"
+
+                else:
+
+                    face_color = "black"
+
+                rectangle = Rectangle(
+                    (
+                        k - candle_width / 2,
+                        body_low,
+                    ),
+                    candle_width,
+                    body_height,
+                    facecolor=face_color,
+                    edgecolor="black",
+                    linewidth=1.2,
+                )
+
+                ax.add_patch(
+                    rectangle
+                )
+
+            # ------------------------------------------------
+            # ENTRY / EXIT POSITIONS
+            # ------------------------------------------------
+
+            entry_position = (
+                entry_i - a
+            )
+
+            exit_position = (
+                exit_i - a
+            )
+
+            # ------------------------------------------------
+            # TRADE LEVELS
+            # ------------------------------------------------
+
+            ax.axhline(
+                trade["entry"],
+                linestyle="--",
+                linewidth=1.5,
+                label=(
+                    f'Entry '
+                    f'{trade["entry"]:.5f}'
+                ),
+            )
+
+            ax.axhline(
+                trade["tp"],
+                linestyle=":",
+                linewidth=1.5,
+                label=(
+                    f'TP '
+                    f'{trade["tp"]:.5f}'
+                ),
+            )
+
+            ax.axhline(
+                trade["sl"],
+                linestyle=":",
+                linewidth=1.5,
+                label=(
+                    f'SL '
+                    f'{trade["sl"]:.5f}'
+                ),
+            )
+
+            # ------------------------------------------------
+            # ENTRY / EXIT MARKERS
+            # ------------------------------------------------
+
+            ax.axvline(
+                entry_position,
+                linestyle="--",
+                linewidth=1.2,
+            )
+
+            ax.axvline(
+                exit_position,
+                linestyle="--",
+                linewidth=1.2,
+            )
+
+            # ------------------------------------------------
+            # X AXIS
+            # ------------------------------------------------
+
+            ax.set_xlim(
+                -1,
+                len(chart_data),
+            )
+
+            # Show fewer labels so they don't overlap
+            step = max(
+                1,
+                len(chart_data) // 12,
+            )
+
+            tick_positions = list(
+                range(
+                    0,
+                    len(chart_data),
+                    step,
+                )
+            )
+
+            tick_labels = []
+
+            for pos in tick_positions:
+
+                timestamp = chart_data.iloc[
+                    pos
+                ]["timestamp"]
+
+                tick_labels.append(
+                    timestamp.strftime(
+                        "%d %b\n%H:%M"
+                    )
+                )
+
+            ax.set_xticks(
+                tick_positions
+            )
+
+            ax.set_xticklabels(
+                tick_labels,
+                rotation=0,
+                fontsize=9,
+            )
+
+            # ------------------------------------------------
+            # TITLES / LABELS
+            # ------------------------------------------------
+
+            ax.set_title(
+                f'Rank {int(row["rank"])} | '
+                f'{row["direction"]} | '
+                f'{row["session"]} | '
+                f'RR {row["rr"]:.1f}\n'
+                f'{trade["reason"]} | '
+                f'{trade["entry_time"]}',
+                fontsize=13,
+                fontweight="bold",
+            )
+
+            ax.set_ylabel(
+                "Price",
+                fontsize=11,
+            )
+
+            ax.set_xlabel(
+                "15m bars around trade",
+                fontsize=11,
+            )
+
+            # ------------------------------------------------
+            # GRID
+            # ------------------------------------------------
+
+            ax.grid(
+                True,
+                alpha=0.25,
+                linewidth=0.7,
+            )
+
+            # ------------------------------------------------
+            # LEGEND
+            # ------------------------------------------------
+
+            ax.legend(
+                loc="best",
+                fontsize=10,
+            )
+
+            # ------------------------------------------------
+            # LAYOUT
+            # ------------------------------------------------
+
+            fig.tight_layout()
+
+            filename = (
+                f'rank_'
+                f'{int(row["rank"]):03d}'
+                f'_trade_{n}.png'
+            )
+
+            fig.savefig(
+                output_dir / filename,
+                dpi=160,
+                bbox_inches="tight",
+            )
+
+            plt.close(fig)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    args = defaults(
+        parse_args()
+    )
+
+    # --------------------------------------------------------
+    # LOAD DATA
+    # --------------------------------------------------------
+
+    df = load_data(
+        args.data
+    )
+
+    print(
+        f"Data: "
+        f"{df['timestamp'].min()} "
+        f"-> "
+        f"{df['timestamp'].max()}"
+    )
+
+    print(
+        f"Rows: {len(df):,}"
+    )
+
+    print(
+        "Sessions found:"
+    )
+
+    print(
+        df["session"]
+        .value_counts(dropna=False)
+        .to_string()
+    )
+
+    # --------------------------------------------------------
+    # PERIODS
+    # --------------------------------------------------------
+
+    periods = get_periods(
+        df,
+        args.start,
+        args.end,
+    )
+
+    print(
+        "\nPeriods:"
+    )
+
+    for name, (
+        start,
+        end,
+    ) in periods.items():
+
+        print(
+            f"  {name}: "
+            f"{start} -> {end}"
+        )
+
+    # --------------------------------------------------------
+    # LOAD CANDIDATES
+    # --------------------------------------------------------
+
+    print(
+        f"\nLoading candidates: "
+        f"{args.candidates}"
+    )
+
+    candidates = pd.read_csv(
+        args.candidates
+    )
+
+    required_candidate_columns = [
+        "direction",
+        "session",
+        "conditions",
+    ]
+
+    missing_candidate_columns = [
+        c
+        for c in required_candidate_columns
+        if c not in candidates.columns
+    ]
+
+    if missing_candidate_columns:
+
+        raise ValueError(
+            "Candidate file is missing required columns: "
+            + ", ".join(
+                missing_candidate_columns
+            )
+        )
+
+    candidates["direction"] = (
+        candidates["direction"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    candidates["session"] = (
+        candidates["session"]
+        .astype(str)
+        .str.strip()
+    )
+
+    candidates["conditions"] = (
+        candidates["conditions"]
+        .astype(str)
+        .str.strip()
+    )
+
+    candidates = (
+        candidates
+        .drop_duplicates(
+            [
+                "direction",
+                "session",
+                "conditions",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    if not args.all_candidates:
+
+        candidates = candidates.head(
+            args.max_candidates
+        )
+
+    print(
+        f"\nUnique candidates: "
+        f"{len(candidates)}"
+    )
+
+    print(
+        f"RRs: "
+        f"{rr_grid(args.rr_start, args.rr_stop, args.rr_step)}"
+    )
+
+    # --------------------------------------------------------
+    # DIAGNOSTIC COLUMNS
+    # --------------------------------------------------------
+
+    print(
+        "\nChecking candidate conditions..."
+    )
+
+    available_columns = set(
+        df.columns
+    )
+
+    valid_condition_candidates = 0
+    invalid_condition_candidates = 0
+
+    for _, candidate in candidates.iterrows():
+
+        condition_list = [
+            x.strip()
+            for x in str(
+                candidate["conditions"]
+            ).split("+")
+            if x.strip()
+        ]
+
+        missing = [
+            condition
+            for condition in condition_list
+            if condition not in available_columns
+        ]
+
+        if missing:
+
+            invalid_condition_candidates += 1
+
+        else:
+
+            valid_condition_candidates += 1
+
+    print(
+        f"Candidates with valid condition columns: "
+        f"{valid_condition_candidates}"
+    )
+
+    print(
+        f"Candidates with missing condition columns: "
+        f"{invalid_condition_candidates}"
+    )
+
+    # --------------------------------------------------------
+    # DATABASE
+    # --------------------------------------------------------
+
+    con = init_db(
+        args.db
+    )
+
+    period_rows = []
+
+    rrs = rr_grid(
+        args.rr_start,
+        args.rr_stop,
+        args.rr_step,
+    )
+
+    total_signal_count = 0
+    total_trade_count = 0
+    candidates_with_signals = 0
+    candidates_with_trades = 0
+
+    # --------------------------------------------------------
+    # RUN CANDIDATES
+    # --------------------------------------------------------
+
+    for ci, candidate in candidates.iterrows():
+
+        candidate_signal_count = 0
+        candidate_trade_count = 0
+
+        for period, (
+            start,
+            end,
+        ) in periods.items():
+
+            sub = df[
+                (df["timestamp"] >= start)
+                & (df["timestamp"] <= end)
+            ].copy().reset_index(
+                drop=True
+            )
+
+            indices = signal_indices(
+                sub,
+                candidate["direction"],
+                candidate["session"],
+                candidate["conditions"],
+            )
+
+            candidate_signal_count += len(
+                indices
+            )
+
+            for rr in rrs:
+
+                key = stable_key(
+                    candidate["direction"],
+                    candidate["session"],
+                    candidate["conditions"],
+                    rr,
+                    period,
+                    args.max_bars,
+                    args.max_open_trades,
+                )
+
+                cached = None
+
+                if not args.force:
+
+                    cached = db_get(
+                        con,
+                        key,
+                    )
+
+                if cached is not None:
+
+                    row = cached
+
+                else:
+
+                    result = backtest(
+                        sub,
+                        indices,
+                        candidate["direction"],
+                        rr,
+                        args.max_bars,
+                        args.max_open_trades,
+                    )
+
+                    if result is None:
+
+                        result = {
+                            "trades": 0,
+                            "wins": 0,
+                            "losses": 0,
+                            "win_rate": 0.0,
+                            "profit_factor": 0.0,
+                            "net_r": 0.0,
+                            "expectancy_r": 0.0,
+                            "max_drawdown_r": 0.0,
+                            "avg_trades_day": 0.0,
+                            "max_concurrent": 0,
+                            "avg_hold_bars": 0.0,
+                            "trades_detail": [],
+                        }
+
+                    row = {
+                        "key": key,
+                        "direction": candidate["direction"],
+                        "session": candidate["session"],
+                        "conditions": candidate["conditions"],
+                        "rr": float(rr),
+                        "period": period,
+                        "start": str(start),
+                        "end": str(end),
+
+                        **{
+                            k: v
+                            for k, v
+                            in result.items()
+                            if k != "trades_detail"
+                        },
+
+                        "result_json": json.dumps(
+                            result[
+                                "trades_detail"
+                            ]
+                        ),
+                    }
+
+                    db_put(
+                        con,
+                        row
+                    )
+
+                    con.commit()
+
+                period_rows.append(
+                    row
+                )
+
+                candidate_trade_count += int(
+                    row["trades"]
+                )
+
+        total_signal_count += (
+            candidate_signal_count
+        )
+
+        total_trade_count += (
+            candidate_trade_count
+        )
+
+        if candidate_signal_count > 0:
+            candidates_with_signals += 1
+
+        if candidate_trade_count > 0:
+            candidates_with_trades += 1
+
+        if candidate_signal_count == 0:
+
+            print(
+                f"Candidate "
+                f"{ci + 1}/"
+                f"{len(candidates)} "
+                f"-> SIGNALS: 0 "
+                f"| {candidate['direction']} "
+                f"| {candidate['session']} "
+                f"| {candidate['conditions']}"
+            )
+
+        elif candidate_trade_count == 0:
+
+            print(
+                f"Candidate "
+                f"{ci + 1}/"
+                f"{len(candidates)} "
+                f"-> SIGNALS: "
+                f"{candidate_signal_count} "
+                f"| TRADES: 0 "
+                f"| {candidate['direction']} "
+                f"| {candidate['session']}"
+            )
+
+        elif (
+            (ci + 1) % 10 == 0
+            or ci == len(candidates) - 1
+        ):
+
+            print(
+                f"Processed "
+                f"{ci + 1}/"
+                f"{len(candidates)} "
+                f"candidates "
+                f"| signals="
+                f"{candidate_signal_count} "
+                f"| trades="
+                f"{candidate_trade_count}"
+            )
+
+    # --------------------------------------------------------
+    # GLOBAL DIAGNOSTICS
+    # --------------------------------------------------------
+
+    print(
+        "\n============================================================"
+    )
+
+    print("DIAGNOSTICS")
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        f"Candidates tested: "
+        f"{len(candidates)}"
+    )
+
+    print(
+        f"Candidates with signals: "
+        f"{candidates_with_signals}"
+    )
+
+    print(
+        f"Candidates with trades: "
+        f"{candidates_with_trades}"
+    )
+
+    print(
+        f"Total signals: "
+        f"{total_signal_count:,}"
+    )
+
+    print(
+        f"Total trades: "
+        f"{total_trade_count:,}"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    # --------------------------------------------------------
+    # SAVE PERIOD RESULTS
+    # --------------------------------------------------------
+
+    if not period_rows:
+
+        print(
+            "\nNo period results were generated."
+        )
+
+        con.close()
+
+        return
+
+    p = pd.DataFrame(
+        period_rows
+    )
+
+    p.to_csv(
+        str(args.out)
+        + "_periods.csv",
+        index=False,
+    )
+
+    # --------------------------------------------------------
+    # BUILD RR SUMMARIES
+    # --------------------------------------------------------
+
+    summaries = []
+
+    grouped = p.groupby(
+        [
+            "direction",
+            "session",
+            "conditions",
+            "rr",
+        ],
+        sort=False,
+    )
+
+    for keys, group in grouped:
+
+        (
+            direction,
+            session,
+            conditions,
+            rr,
+        ) = keys
+
+        all_rows = group[
+            group["period"] == "ALL"
+        ]
+
+        if all_rows.empty:
+            continue
+
+        all_row = all_rows.iloc[0]
+
+        if int(
+            all_row["trades"]
+        ) <= 0:
+            continue
+
+        year_rows = group[
+            group["period"] != "ALL"
+        ]
+
+        if len(year_rows):
+
+            positive_years = int(
+                (
+                    year_rows["net_r"] > 0
+                ).sum()
+            )
+
+            enough_years = int(
+                (
+                    year_rows["trades"]
+                    >= max(
+                        5,
+                        args.min_trades / 2,
+                    )
+                ).sum()
+            )
+
+            worst_year_pf = float(
+                year_rows[
+                    "profit_factor"
+                ].min()
+            )
+
+            avg_year_expectancy = float(
+                year_rows[
+                    "expectancy_r"
+                ].mean()
+            )
+
+        else:
+
+            positive_years = 0
+            enough_years = 0
+
+            worst_year_pf = float(
+                all_row["profit_factor"]
+            )
+
+            avg_year_expectancy = float(
+                all_row["expectancy_r"]
+            )
+
+        score = robust_score(
+            all_row,
+            args.min_trades,
+            args.frequency_target,
+        )
+
+        if len(year_rows):
+
+            score *= (
+                0.65
+                + 0.35
+                * (
+                    positive_years
+                    / max(
+                        len(year_rows),
+                        1,
+                    )
+                )
+            )
+
+            if enough_years < len(year_rows):
+
+                score *= 0.75
+
+        summaries.append(
+            {
+                "direction": direction,
+                "session": session,
+                "conditions": conditions,
+                "rr": float(rr),
+                "trades": int(
+                    all_row["trades"]
+                ),
+                "net_r": float(
+                    all_row["net_r"]
+                ),
+                "expectancy_r": float(
+                    all_row["expectancy_r"]
+                ),
+                "profit_factor": float(
+                    all_row["profit_factor"]
+                ),
+                "max_drawdown_r": float(
+                    all_row["max_drawdown_r"]
+                ),
+                "win_rate": float(
+                    all_row["win_rate"]
+                ),
+                "avg_trades_day": float(
+                    all_row["avg_trades_day"]
+                ),
+                "max_concurrent": int(
+                    all_row["max_concurrent"]
+                ),
+                "avg_hold_bars": float(
+                    all_row["avg_hold_bars"]
+                ),
+                "positive_years": positive_years,
+                "years_tested": int(
+                    len(year_rows)
+                ),
+                "worst_year_pf": worst_year_pf,
+                "avg_year_expectancy_r": (
+                    avg_year_expectancy
+                ),
+                "base_score": float(score),
+            }
+        )
+
+    s = pd.DataFrame(
+        summaries
+    )
+
+    # --------------------------------------------------------
+    # ZERO-TRADE PROTECTION
+    # --------------------------------------------------------
+
+    if s.empty:
+
+        print(
+            "\nNo non-zero-trade results found."
+        )
+
+        print(
+            "\nThe diagnostic information above "
+            "shows whether the problem is:"
+        )
+
+        print("  1. No matching signals")
+        print("  2. Missing condition columns")
+        print("  3. Signals but no executable trades")
+        print("  4. Candidate/session mismatch")
+
+        con.close()
+
+        return
+
+    # --------------------------------------------------------
+    # RR STABILITY
+    # --------------------------------------------------------
+
+    s["rr_stability"] = 0.0
+
+    strategy_groups = s.groupby(
+        [
+            "direction",
+            "session",
+            "conditions",
+        ],
+        sort=False,
+    )
+
+    for strategy_key, group in strategy_groups:
+
+        best_score = float(
+            group["base_score"].max()
+        )
+
+        if best_score <= 0:
+            continue
+
+        best_index = group[
+            "base_score"
+        ].idxmax()
+
+        best_rr = float(
+            group.loc[
+                best_index,
+                "rr",
+            ]
+        )
+
+        nearby = group[
+            abs(
+                group["rr"] - best_rr
+            ) <= 0.5
+        ]
+
+        if len(nearby):
+
+            stability = float(
+                nearby["base_score"].mean()
+                / best_score
+            )
+
+        else:
+
+            stability = 0.0
+
+        stability = max(
+            0.0,
+            min(
+                stability,
+                1.0,
+            ),
+        )
+
+        s.loc[
+            group.index,
+            "rr_stability",
+        ] = stability
+
+    # --------------------------------------------------------
+    # FINAL SCORE
+    # --------------------------------------------------------
+
+    s["robust_score"] = (
+        s["base_score"]
+        * (
+            0.75
+            + 0.25
+            * s["rr_stability"]
+        )
+    )
+
+    # --------------------------------------------------------
+    # FILTERS
+    # --------------------------------------------------------
+
+    s["meets_sample"] = (
+        s["trades"]
+        >= args.min_trades
+    )
+
+    s["meets_frequency"] = (
+        s["avg_trades_day"]
+        >= args.min_trades_per_day
+    )
+
+    eligible = s[
+        s["meets_sample"]
+        & s["meets_frequency"]
+    ].copy()
+
+    # --------------------------------------------------------
+    # IF NOTHING PASSES
+    # --------------------------------------------------------
+
+    if eligible.empty:
+
+        print(
+            "\nNo strategies passed "
+            "the minimum sample/frequency "
+            "requirements."
+        )
+
+        diagnostic = (
+            s.sort_values(
+                [
+                    "trades",
+                    "net_r",
+                    "robust_score",
+                ],
+                ascending=False,
+            )
+            .reset_index(drop=True)
+        )
+
+        diagnostic.insert(
+            0,
+            "rank",
+            range(
+                1,
+                len(diagnostic) + 1,
+            ),
+        )
+
+        diagnostic.to_csv(
+            str(args.out)
+            + "_final.csv",
+            index=False,
+        )
+
+        pd.DataFrame().to_csv(
+            str(args.out)
+            + "_top_final.csv",
+            index=False,
+        )
+
+        print(
+            "\nBest available results "
+            "before minimum filters:"
+        )
+
+        print(
+            diagnostic[
+                [
+                    "rank",
+                    "direction",
+                    "session",
+                    "conditions",
+                    "rr",
+                    "trades",
+                    "net_r",
+                    "profit_factor",
+                    "robust_score",
+                ]
+            ].head(
+                args.final_n
+            ).to_string(
+                index=False
+            )
+        )
+
+        con.close()
+
+        return
+
+    # --------------------------------------------------------
+    # ONE BEST RR PER UNIQUE STRATEGY
+    # --------------------------------------------------------
+
+    best_per_strategy = (
+        eligible
+        .sort_values(
+            [
+                "robust_score",
+                "net_r",
+                "profit_factor",
+                "trades",
+            ],
+            ascending=False,
+        )
+        .drop_duplicates(
+            [
+                "direction",
+                "session",
+                "conditions",
+            ],
+            keep="first",
+        )
+        .copy()
+    )
+
+    best_per_strategy = (
+        best_per_strategy
+        .sort_values(
+            [
+                "robust_score",
+                "net_r",
+                "profit_factor",
+                "trades",
+            ],
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    best_per_strategy.insert(
+        0,
+        "rank",
+        range(
+            1,
+            len(best_per_strategy) + 1,
+        ),
+    )
+
+    # --------------------------------------------------------
+    # SAVE ALL RR RESULTS
+    # --------------------------------------------------------
+
+    s = (
+        s.sort_values(
+            [
+                "meets_sample",
+                "meets_frequency",
+                "robust_score",
+                "net_r",
+            ],
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    s.insert(
+        0,
+        "overall_rank",
+        range(
+            1,
+            len(s) + 1,
+        ),
+    )
+
+    s.to_csv(
+        str(args.out)
+        + "_final.csv",
+        index=False,
+    )
+
+    # --------------------------------------------------------
+    # TOP FINAL
+    # --------------------------------------------------------
+
+    top = best_per_strategy.head(
+        args.final_n
+    ).copy()
+
+    top.to_csv(
+        str(args.out)
+        + "_top_final.csv",
+        index=False,
+    )
+
+    # --------------------------------------------------------
+    # CHARTS
+    # --------------------------------------------------------
+
+    if args.charts and len(top):
+
+        details = []
+
+        for _, row in top.iterrows():
+
+            matching = p[
+                (p["period"] == "ALL")
+                & (
+                    p["direction"]
+                    == row["direction"]
+                )
+                & (
+                    p["session"]
+                    == row["session"]
+                )
+                & (
+                    p["conditions"]
+                    == row["conditions"]
+                )
+                & (
+                    np.isclose(
+                        p["rr"],
+                        row["rr"],
+                    )
+                )
+            ]
+
+            if matching.empty:
+
+                details.append([])
+
+                continue
+
+            result_row = matching.iloc[0]
+
+            try:
+
+                details.append(
+                    json.loads(
+                        result_row[
+                            "result_json"
+                        ]
+                    )
+                )
+
+            except Exception:
+
+                details.append([])
+
+        top_with_details = top.copy()
+
+        top_with_details[
+            "_detail"
+        ] = details
+
+        save_trade_charts(
+            df,
+            top_with_details,
+            str(args.out)
+            + "_charts",
+        )
+
+    # --------------------------------------------------------
+    # OUTPUT
+    # --------------------------------------------------------
+
+    print(
+        "\n============================================================"
+    )
+
+    print("TOP FINAL")
+
+    print(
+        "============================================================"
+    )
+
+    display_columns = [
+        "rank",
+        "direction",
+        "session",
+        "conditions",
+        "rr",
+        "trades",
+        "net_r",
+        "profit_factor",
+        "max_drawdown_r",
+        "avg_trades_day",
+        "positive_years",
+        "years_tested",
+        "rr_stability",
+        "robust_score",
+    ]
+
+    print(
+        top[
+            display_columns
+        ].to_string(
+            index=False
+        )
+    )
+
+    print(
+        f"\nUnique strategies passing filters: "
+        f"{len(best_per_strategy)}"
+    )
+
+    print(
+        f"Saved: "
+        f"{args.out}_final.csv"
+    )
+
+    print(
+        f"Saved: "
+        f"{args.out}_top_final.csv"
+    )
+
+    print(
+        f"Saved: "
+        f"{args.out}_periods.csv"
+    )
+
+    print(
+        f"Cache: "
+        f"{args.db}"
+    )
+
+    if args.charts:
+
+        print(
+            f"Charts: "
+            f"{args.out}_charts"
+        )
+
+    con.close()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()

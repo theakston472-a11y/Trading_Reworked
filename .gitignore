@@ -1,0 +1,89 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.code-workspace
+
+# Secrets and machine-local environment files
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*credentials*.json
+*secrets*.json
+
+# Temporary upgrade/build working areas
+_pipeline_upgrade_temp/
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.before_*
+
+# Runtime logs
+logs/
+*.log
+
+# Generated charts, reports, results, and historical archives
+charts/
+reports/
+results/
+archive/
+
+# Local databases and computation caches
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.duckdb
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.joblib
+
+# Raw/generated market data: keep documentation and explicit samples/fixtures
+data/*
+!data/README.md
+!data/**/README.md
+!data/sample*.csv
+!data/**/*_sample.csv
+!data/fixtures/
+!data/fixtures/**
+
+# Generated analysis/research tables (source code remains tracked)
+quant/**/*.csv
+quant/**/*.xlsx
+research/**/*.csv
+research/**/*.xlsx
+trades/**/*.csv
+
+# Archives and compressed exports
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini

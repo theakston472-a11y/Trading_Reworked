@@ -1,0 +1,93 @@
+import pandas as pd
+
+
+
+def search_confluences(
+    filename="research/results.csv"
+):
+
+    df = pd.read_csv(
+        filename
+    )
+
+
+    print()
+    print("="*50)
+    print("ADVANCED CONFLUENCE SEARCH")
+    print("="*50)
+
+
+
+    # body strength filter
+
+    df["Strong_Candle"] = (
+        df["Body Strength"]
+        >=
+        0.6
+    )
+
+
+
+    results = (
+        df
+        .groupby(
+            [
+                "Session",
+                "Day",
+                "Direction",
+                "Trend",
+                "EMA",
+                "Strong_Candle"
+            ]
+        )
+        .agg(
+            Trades=("R","count"),
+
+            Wins=(
+                "Result",
+                lambda x:
+                (x=="WIN").sum()
+            ),
+
+            Total_R=(
+                "R",
+                "sum"
+            )
+        )
+    )
+
+
+
+    results["Win Rate"] = (
+        results["Wins"]
+        /
+        results["Trades"]
+        *
+        100
+    ).round(2)
+
+
+
+    results = results[
+        results["Trades"]
+        >=
+        30
+    ]
+
+
+
+    results = results.sort_values(
+        "Total_R",
+        ascending=False
+    )
+
+
+
+    print()
+
+    print(
+        results.head(30)
+    )
+
+
+    return results

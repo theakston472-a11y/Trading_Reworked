@@ -1,0 +1,17 @@
+[
+  {
+    "name": "SELL_NY_LIQUIDITY_SWEEP_BEARISH_CONFIRMATION",
+    "direction": "SELL",
+    "session": "New York",
+    "conditions": [
+      "liquidity_sweep_high",
+      "bearish_candle",
+      "bearish_engulfing"
+    ],
+    "risk_per_trade": 0.01,
+    "one_position_at_a_time": true,
+    "historical_best_rr_recent_period": 1.8,
+    "notes": "Strategy discovered and tested using the quant research pipeline. Recent-period test covered 2025-01-01 through 2026-08-31, with actual available data through 2026-08-07.",
+    "saved_at_utc": "2026-08-10T17:24:01.745838+00:00"
+  }
+]
