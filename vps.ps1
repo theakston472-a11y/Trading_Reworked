@@ -5,6 +5,8 @@ $baseUrl = "https://raw.githubusercontent.com/theakston472-a11y/Trading_Reworked
 $files = @(
     "requirements-paper-bot.txt",
     "sentry_setup.py",
+    "quant/feature_engine.py",
+    "quant/institutional_features.py",
     "scripts/alpha_mt5_paper_bot.py",
     "scripts/start_alpha_paper_bot.ps1",
     "scripts/check_alpha_paper_bot.ps1",
