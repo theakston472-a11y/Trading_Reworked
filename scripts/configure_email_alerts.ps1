@@ -6,15 +6,26 @@ $credentialPath = Join-Path $stateDirectory "email_credentials.xml"
 $senderScript = Join-Path $PSScriptRoot "send_paper_bot_email.ps1"
 
 New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
-$sender = (Read-Host "Yahoo sender email address").Trim()
+$sender = (Read-Host "Sender email address (Gmail or Yahoo)").Trim()
 if ([string]::IsNullOrWhiteSpace($sender)) {
     throw "Sender email cannot be empty."
+}
+if ($sender -match "@gmail\.com$") {
+    $provider = "Gmail"
+    $smtpHost = "smtp.gmail.com"
+}
+elseif ($sender -match "@yahoo\.[a-z.]+$") {
+    $provider = "Yahoo"
+    $smtpHost = "smtp.mail.yahoo.com"
+}
+else {
+    throw "Only Gmail and Yahoo sender addresses are currently supported."
 }
 $recipient = (Read-Host "Alert recipient email (press Enter to use the same address)").Trim()
 if ([string]::IsNullOrWhiteSpace($recipient)) {
     $recipient = $sender
 }
-$appPassword = Read-Host "Paste the Yahoo app password (hidden)" -AsSecureString
+$appPassword = Read-Host "Paste the $provider app password (hidden)" -AsSecureString
 $temporaryCredential = New-Object System.Management.Automation.PSCredential($sender, $appPassword)
 $normalizedPassword = $temporaryCredential.GetNetworkCredential().Password -replace "\s", ""
 if ([string]::IsNullOrWhiteSpace($normalizedPassword)) {
@@ -26,13 +37,13 @@ $normalizedPassword = $null
 $credential | Export-Clixml -LiteralPath $credentialPath -Force
 
 [ordered]@{
-    smtp_host = "smtp.mail.yahoo.com"
+    smtp_host = $smtpHost
     smtp_port = 587
     sender = $sender
     recipient = $recipient
 } | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
 
-Write-Host "Yahoo email settings saved securely for this Windows user and VPS."
+Write-Host "$provider email settings saved securely for this Windows user and VPS."
 & $senderScript -Subject "Paper Bot - Email Test" -Body @"
 Your VPS paper-bot email monitoring is configured.
 
