@@ -15,7 +15,14 @@ if ([string]::IsNullOrWhiteSpace($recipient)) {
     $recipient = $sender
 }
 $appPassword = Read-Host "Paste the Yahoo app password (hidden)" -AsSecureString
-$credential = New-Object System.Management.Automation.PSCredential($sender, $appPassword)
+$temporaryCredential = New-Object System.Management.Automation.PSCredential($sender, $appPassword)
+$normalizedPassword = $temporaryCredential.GetNetworkCredential().Password -replace "\s", ""
+if ([string]::IsNullOrWhiteSpace($normalizedPassword)) {
+    throw "Yahoo app password cannot be empty."
+}
+$protectedPassword = ConvertTo-SecureString $normalizedPassword -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential($sender, $protectedPassword)
+$normalizedPassword = $null
 $credential | Export-Clixml -LiteralPath $credentialPath -Force
 
 [ordered]@{
@@ -34,4 +41,3 @@ Recipient: $recipient
 This is a paper-only bot and does not place broker orders.
 "@
 Write-Host "Check the recipient inbox for the test message."
-

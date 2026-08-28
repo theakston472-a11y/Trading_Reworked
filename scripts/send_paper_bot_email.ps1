@@ -28,8 +28,9 @@ if ([string]::IsNullOrWhiteSpace($Subject)) {
 
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
 $credential = Import-Clixml -LiteralPath $credentialPath
-$mail = New-Object System.Net.Mail.MailMessage
-$client = New-Object System.Net.Mail.SmtpClient([string]$config.smtp_host, [int]$config.smtp_port)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$mail = [System.Net.Mail.MailMessage]::new()
+$client = [System.Net.Mail.SmtpClient]::new([string]$config.smtp_host, [int]$config.smtp_port)
 try {
     $mail.From = [string]$config.sender
     [void]$mail.To.Add([string]$config.recipient)
@@ -43,8 +44,16 @@ try {
     $client.Send($mail)
     Write-Host "EMAIL SENT"
 }
+catch {
+    $messages = New-Object System.Collections.Generic.List[string]
+    $current = $_.Exception
+    while ($null -ne $current) {
+        [void]$messages.Add($current.Message)
+        $current = $current.InnerException
+    }
+    throw "Email send failed: $($messages -join ' -> ')"
+}
 finally {
     $mail.Dispose()
     $client.Dispose()
 }
-
