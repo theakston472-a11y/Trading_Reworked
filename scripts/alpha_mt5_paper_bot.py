@@ -16,8 +16,11 @@ import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from paper_bot_email import notify_event, send_daily_summary, send_email
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -38,6 +41,7 @@ LIVE_BAR_MAX_AGE_MINUTES = 35
 EVENT_JOURNAL = None
 CHART_DIR = None
 FEATURE_CACHE = None
+EMAIL_STATE_DIR = None
 JOURNAL_FIELDS = [
     "time", "kind", "processing_mode", "bar_time", "strategy", "reason",
     "entry_mode", "entry", "sl", "tp", "price", "stop_pips",
@@ -75,7 +79,7 @@ def initial_state():
         "personal_daily_limit": 0.03,
         "broker_day": None, "last_bar_time": None, "trading_days": [],
         "positions": [], "pending": [], "events": [], "locked": False,
-        "lock_reason": None,
+        "lock_reason": None, "last_daily_email_date": None,
     }
 
 
@@ -102,6 +106,11 @@ def event(state, kind, **details):
                 writer.writeheader()
             writer.writerow(record)
     print(json.dumps(record, default=str), flush=True)
+    if EMAIL_STATE_DIR is not None:
+        try:
+            notify_event(kind, details, state, EMAIL_STATE_DIR)
+        except Exception as exc:
+            print(f"WARNING: event email failed: {exc}", file=sys.stderr, flush=True)
 
 
 def bar_processing_mode(timestamp):
@@ -465,6 +474,17 @@ def write_health(state_dir, state, latest_bar):
     atomic_json(health, state_dir / "health.json")
 
 
+def maybe_send_daily_email(state, state_dir, latest_bar):
+    london_now = datetime.now(ZoneInfo("Europe/London"))
+    today = london_now.date().isoformat()
+    if london_now.hour < 18 or state.get("last_daily_email_date") == today:
+        return False
+    if send_daily_summary(state, state_dir, latest_bar):
+        state["last_daily_email_date"] = today
+        return True
+    return False
+
+
 def print_saved_status(state, state_dir):
     closes = [x for x in state.get("events", []) if x.get("kind") == "CLOSE"]
     live = [x for x in closes if x.get("processing_mode") == "LIVE"]
@@ -503,6 +523,8 @@ def cycle(args, state, state_path, mt5, strategies):
         state["last_bar_time"] = bar.timestamp.isoformat()
     atomic_json(state, state_path)
     write_health(args.state_dir, state, features.iloc[-1]["timestamp"])
+    if maybe_send_daily_email(state, args.state_dir, features.iloc[-1]["timestamp"]):
+        atomic_json(state, state_path)
     print(f"status stage={state['stage']} balance={state['balance']:.2f} equity={equity(state, float(features.iloc[-1]['close'])):.2f} open={len(state['positions'])} pending={len(state['pending'])} days={len(state['trading_days'])} locked={state['locked']}", flush=True)
 
 
@@ -538,13 +560,14 @@ def self_test():
 
 
 def main():
-    global EVENT_JOURNAL, CHART_DIR
+    global EVENT_JOURNAL, CHART_DIR, EMAIL_STATE_DIR
     args = cli()
     if args.self_test:
         self_test(); return 0
     state, state_path = load_state(args.state_dir)
     EVENT_JOURNAL = args.state_dir / "trade_journal.csv"
     CHART_DIR = None if args.no_charts else args.state_dir / "charts"
+    EMAIL_STATE_DIR = args.state_dir
     if args.status:
         print_saved_status(state, args.state_dir)
         return 0
@@ -560,6 +583,9 @@ def main():
     strategies = pd.read_csv(args.shortlist)
     mt5 = connect_mt5(args.terminal_path)
     try:
+        event(state, "BOT_STARTED", balance=state["balance"],
+              message="MT5 connected; paper-only monitoring is active")
+        atomic_json(state, state_path)
         while True:
             cycle(args, state, state_path, mt5, strategies)
             if args.once:
@@ -579,6 +605,14 @@ if __name__ == "__main__":
             if init_sentry():
                 import sentry_sdk
                 sentry_sdk.capture_exception(exc)
+        except Exception:
+            pass
+        try:
+            send_email(
+                "Paper Bot - STOPPED WITH ERROR",
+                f"The paper bot stopped.\n\nError: {exc}\nTime UTC: {datetime.now(timezone.utc).isoformat()}",
+                EMAIL_STATE_DIR or DEFAULT_STATE,
+            )
         except Exception:
             pass
         print(f"ERROR: {exc}", file=sys.stderr)
