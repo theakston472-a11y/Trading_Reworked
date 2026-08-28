@@ -1,0 +1,5 @@
+pandas>=2.2,<3
+numpy>=1.26,<3
+MetaTrader5==5.0.6090
+matplotlib>=3.10,<4
+sentry-sdk>=2,<3
