@@ -12,6 +12,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 
 INTERESTING_EVENTS = {
@@ -118,21 +119,39 @@ def notify_event(kind: str, details: dict, state: dict, state_dir: Path) -> bool
 
 def send_daily_summary(state: dict, state_dir: Path, last_bar_time) -> bool:
     closes = [item for item in state.get("events", []) if item.get("kind") == "CLOSE"]
+    london_now = datetime.now(ZoneInfo("Europe/London"))
+
+    def is_live_close_today(item: dict) -> bool:
+        if item.get("processing_mode") == "CATCH_UP":
+            return False
+        try:
+            event_time = datetime.fromisoformat(str(item.get("time")))
+            return event_time.astimezone(ZoneInfo("Europe/London")).date() == london_now.date()
+        except (TypeError, ValueError):
+            return False
+
+    live_closes = [item for item in closes if item.get("processing_mode") != "CATCH_UP"]
+    today_closes = [item for item in live_closes if is_live_close_today(item)]
+    today_result_r = sum(float(item.get("result_r", 0) or 0) for item in today_closes)
+    today_wins = sum(float(item.get("result_r", 0) or 0) > 0 for item in today_closes)
+    today_losses = sum(float(item.get("result_r", 0) or 0) < 0 for item in today_closes)
     body = "\n".join(
         [
             "DAILY PAPER BOT SUMMARY",
             "",
-            f"Time UTC: {datetime.now(timezone.utc).isoformat()}",
+            f"Time UK: {london_now.isoformat()}",
             f"Stage: {state.get('stage')}",
             f"Paper balance: {state.get('balance', 0):,.2f}",
             f"Open positions: {len(state.get('positions', []))}",
             f"Pending entries: {len(state.get('pending', []))}",
-            f"Closed trades recorded: {len(closes)}",
+            f"Live trades closed today: {len(today_closes)}",
+            f"Today's live result: {today_result_r:+.3f}R ({today_wins} wins / {today_losses} losses)",
+            f"All live trades recorded: {len(live_closes)}",
             f"Last processed candle: {last_bar_time}",
             f"Locked: {state.get('locked')}",
             "",
+            "Catch-up/replayed trades are excluded from today's figures.",
             "Paper-only monitoring: no broker order was sent.",
         ]
     )
     return send_email("Paper Bot - Daily Summary", body, state_dir)
-

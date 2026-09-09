@@ -29,7 +29,7 @@ $appPassword = Read-Host "Paste the $provider app password (hidden)" -AsSecureSt
 $temporaryCredential = New-Object System.Management.Automation.PSCredential($sender, $appPassword)
 $normalizedPassword = $temporaryCredential.GetNetworkCredential().Password -replace "\s", ""
 if ([string]::IsNullOrWhiteSpace($normalizedPassword)) {
-    throw "Yahoo app password cannot be empty."
+    throw "$provider app password cannot be empty."
 }
 $protectedPassword = ConvertTo-SecureString $normalizedPassword -AsPlainText -Force
 $credential = New-Object System.Management.Automation.PSCredential($sender, $protectedPassword)
