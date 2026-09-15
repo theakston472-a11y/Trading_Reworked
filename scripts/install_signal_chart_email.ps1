@@ -16,8 +16,15 @@ $temporaryDirectory = Join-Path $temporaryRoot ("paperbot_signal_chart_" + [guid
 $fileNames = @(
     "alpha_mt5_paper_bot.py",
     "paper_bot_email.py",
+    "send_paper_bot_email.ps1",
+    "email_latest_signal_chart.py"
+)
+$requiredExistingFiles = @(
+    "alpha_mt5_paper_bot.py",
+    "paper_bot_email.py",
     "send_paper_bot_email.ps1"
 )
+$originalFiles = @{}
 $backedUp = $false
 $installed = $false
 
@@ -41,6 +48,7 @@ try {
     $downloadedBot = Join-Path $temporaryDirectory "alpha_mt5_paper_bot.py"
     $downloadedEmail = Join-Path $temporaryDirectory "paper_bot_email.py"
     $downloadedSender = Join-Path $temporaryDirectory "send_paper_bot_email.ps1"
+    $downloadedBackfill = Join-Path $temporaryDirectory "email_latest_signal_chart.py"
     if (-not (Select-String -LiteralPath $downloadedBot -SimpleMatch "def save_signal_chart" -Quiet)) {
         throw "Downloaded bot does not contain the signal-chart feature."
     }
@@ -51,7 +59,7 @@ try {
         throw "Downloaded email sender does not contain attachment support."
     }
 
-    & $python -B -m py_compile $downloadedBot $downloadedEmail
+    & $python -B -m py_compile $downloadedBot $downloadedEmail $downloadedBackfill
     if ($LASTEXITCODE -ne 0) {
         throw "Python validation failed."
     }
@@ -65,12 +73,18 @@ try {
     }
 
     New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
-    foreach ($fileName in $fileNames) {
+    foreach ($fileName in $requiredExistingFiles) {
         $target = Join-Path $scriptDirectory $fileName
         if (-not (Test-Path -LiteralPath $target)) {
             throw "Existing VPS file was not found: $target"
         }
-        Copy-Item -LiteralPath $target -Destination (Join-Path $backupDirectory $fileName)
+    }
+    foreach ($fileName in $fileNames) {
+        $target = Join-Path $scriptDirectory $fileName
+        $originalFiles[$fileName] = Test-Path -LiteralPath $target
+        if ($originalFiles[$fileName]) {
+            Copy-Item -LiteralPath $target -Destination (Join-Path $backupDirectory $fileName)
+        }
     }
     $backedUp = $true
 
@@ -105,8 +119,14 @@ catch {
     if ($installed -and $backedUp) {
         Write-Warning "Update failed; restoring the previous paper-bot files."
         foreach ($fileName in $fileNames) {
-            Copy-Item -LiteralPath (Join-Path $backupDirectory $fileName) `
-                -Destination (Join-Path $scriptDirectory $fileName) -Force
+            $target = Join-Path $scriptDirectory $fileName
+            if ($originalFiles[$fileName]) {
+                Copy-Item -LiteralPath (Join-Path $backupDirectory $fileName) `
+                    -Destination $target -Force
+            }
+            elseif (Test-Path -LiteralPath $target) {
+                Remove-Item -LiteralPath $target -Force
+            }
         }
         try {
             & $startScript

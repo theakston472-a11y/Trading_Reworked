@@ -393,8 +393,9 @@ def save_signal_chart(order, signal_time):
         ax.grid(alpha=0.12, linestyle=":")
         label_parts = strategy_text.split("|")
         session_name = label_parts[1] if len(label_parts) > 1 else "Unknown session"
+        chart_status = str(order.get("chart_status", "PENDING"))
         ax.set_title(
-            f"PENDING {order['direction']} | {session_name} | {order['rr']:g}R target | "
+            f"{chart_status} {order['direction']} | {session_name} | {order['rr']:g}R target | "
             f"setup {signal_time.strftime('%d %b %H:%M')} UTC",
             color="white", fontsize=11,
         )
