@@ -12,6 +12,7 @@ import json
 import math
 import os
 import sys
+import textwrap
 import time
 import warnings
 from datetime import datetime, timezone
@@ -46,7 +47,7 @@ JOURNAL_FIELDS = [
     "time", "kind", "processing_mode", "bar_time", "strategy", "reason",
     "entry_mode", "entry", "sl", "tp", "price", "stop_pips",
     "target_pips", "estimated_lot", "risk_dollars", "result_r", "pnl",
-    "balance", "day", "message",
+    "balance", "day", "message", "pending_entry", "chart_path",
 ]
 
 
@@ -286,6 +287,143 @@ def save_trade_chart(pos, exit_time, exit_price, reason):
         return None
 
 
+def save_signal_chart(order, signal_time):
+    """Save a live pending-entry chart for attachment to the signal email."""
+    if CHART_DIR is None or FEATURE_CACHE is None:
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+
+        frame = FEATURE_CACHE
+        signal_time = pd.Timestamp(signal_time)
+        chart = frame[frame["timestamp"] <= signal_time].tail(88).copy()
+        if chart.empty:
+            return None
+        chart = chart.reset_index(drop=True)
+        signal_row = frame[frame["timestamp"] == signal_time]
+        if signal_row.empty:
+            return None
+        signal_data = signal_row.iloc[0]
+        signal_x = len(chart) - 1
+        expiry_time = pd.Timestamp(order["expires_bar_time"])
+        wait_bars = max(1, int(math.ceil((expiry_time - signal_time) / pd.Timedelta(minutes=15))))
+        right_x = signal_x + wait_bars + 1
+
+        fig, ax = plt.subplots(figsize=(15, 8.5), facecolor="#090d12")
+        ax.set_facecolor("#090d12")
+        for i, row in chart.iterrows():
+            colour = "#22c55e" if row.close >= row.open else "#ef4444"
+            ax.vlines(i, row.low, row.high, color=colour, linewidth=1.0, zorder=2)
+            bottom = min(row.open, row.close)
+            height = max(abs(row.close - row.open), PIP_SIZE * 0.05)
+            ax.add_patch(Rectangle((i - 0.32, bottom), 0.64, height,
+                                   facecolor=colour, edgecolor=colour,
+                                   linewidth=0.7, zorder=3))
+
+        strategy_text = str(order["strategy"])
+        conditions = strategy_text.split("|")[2] if strategy_text.count("|") >= 2 else strategy_text
+        for ema_number, colour in ((20, "#38bdf8"), (100, "#f59e0b"), (200, "#c084fc")):
+            ema_column = f"ema{ema_number}"
+            if f"ema{ema_number}" in conditions.lower() and ema_column in chart.columns:
+                ax.plot(chart.index, chart[ema_column], color=colour, linewidth=1.7,
+                        label=f"EMA {ema_number}", zorder=4)
+
+        fib_ratio = next((ratio for ratio in (382, 500, 618)
+                          if f"fib_{ratio}" in conditions), None)
+        swing_low = signal_data.get("fib_swing_low")
+        swing_high = signal_data.get("fib_swing_high")
+        if pd.notna(swing_low):
+            ax.axhline(float(swing_low), color="#64748b", linewidth=1.0,
+                       linestyle=":", alpha=0.75,
+                       label=f"Confirmed swing low {float(swing_low):.5f}")
+        if pd.notna(swing_high):
+            ax.axhline(float(swing_high), color="#94a3b8", linewidth=1.0,
+                       linestyle=":", alpha=0.75,
+                       label=f"Confirmed swing high {float(swing_high):.5f}")
+
+        current_price = float(signal_data["close"])
+        ax.axhline(current_price, color="#e2e8f0", linewidth=0.9,
+                   linestyle=":", alpha=0.45, label=f"Signal close {current_price:.5f}")
+        ax.axvspan(signal_x - 0.5, signal_x + 0.5, color="#a78bfa", alpha=0.22,
+                   label="Setup candle")
+
+        entry = order.get("entry")
+        sl = order.get("sl")
+        tp = order.get("tp")
+        if entry is not None:
+            entry = float(entry)
+            entry_label = f"ENTRY TO HIT {entry:.5f}"
+            if fib_ratio is not None:
+                entry_label += f" / Fib {fib_ratio / 10:.1f}%"
+            ax.axhline(entry, color="#facc15", linewidth=1.8, linestyle=":",
+                       alpha=0.8, label=entry_label)
+            if sl is not None and tp is not None:
+                sl, tp = float(sl), float(tp)
+                width = max(1, right_x - signal_x)
+                ax.add_patch(Rectangle((signal_x, min(entry, tp)), width,
+                                       abs(tp - entry), facecolor="#22c55e",
+                                       edgecolor="none", alpha=0.11, zorder=0))
+                ax.add_patch(Rectangle((signal_x, min(entry, sl)), width,
+                                       abs(sl - entry), facecolor="#ef4444",
+                                       edgecolor="none", alpha=0.13, zorder=0))
+                ax.axhline(sl, color="#ef4444", linewidth=1.2, linestyle=":",
+                           alpha=0.65, label=f"SL {sl:.5f}")
+                ax.axhline(tp, color="#22c55e", linewidth=1.2, linestyle=":",
+                           alpha=0.65, label=f"TP {tp:.5f} ({order['rr']:g}R)")
+                distance_pips = abs(current_price - entry) / PIP_SIZE
+                ax.annotate(f"Waiting: {distance_pips:.1f} pips to entry",
+                            xy=(signal_x, entry), xytext=(max(0, signal_x - 22), entry),
+                            color="#fde68a", fontsize=10,
+                            arrowprops={"arrowstyle": "->", "color": "#facc15", "alpha": 0.65})
+        else:
+            ax.axvspan(signal_x + 0.5, signal_x + 1.5, color="#facc15", alpha=0.12,
+                       label="Entry will be next M15 candle open")
+
+        time_labels = [pd.Timestamp(x).strftime("%d %b\n%H:%M") for x in chart["timestamp"]]
+        tick_step = max(1, len(chart) // 10)
+        ticks = list(range(0, len(chart), tick_step))
+        ax.set_xticks(ticks, [time_labels[i] for i in ticks])
+        ax.set_xlim(-1, right_x)
+        ax.tick_params(colors="#d1d5db")
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+        ax.grid(alpha=0.12, linestyle=":")
+        label_parts = strategy_text.split("|")
+        session_name = label_parts[1] if len(label_parts) > 1 else "Unknown session"
+        ax.set_title(
+            f"PENDING {order['direction']} | {session_name} | {order['rr']:g}R target | "
+            f"setup {signal_time.strftime('%d %b %H:%M')} UTC",
+            color="white", fontsize=11,
+        )
+        friendly_conditions = conditions.replace("_", " ").replace("+", "  +  ")
+        conditions_footer = textwrap.fill(
+            f"CONDITIONS MET: {friendly_conditions}", width=150
+        )
+        footer = (
+            f"{conditions_footer}\n"
+            f"Entry mode: {order['entry_mode']}  |  Expires: {expiry_time.strftime('%d %b %H:%M')} UTC  |  "
+            "Yellow dotted line = price required before the paper trade opens"
+        )
+        fig.text(0.015, 0.02, footer, color="#cbd5e1", fontsize=9, va="bottom")
+        ax.legend(facecolor="#111827", edgecolor="#334155", labelcolor="white",
+                  loc="best", fontsize=8)
+        fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.17)
+        signal_directory = CHART_DIR / "signals"
+        signal_directory.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() else "_" for c in strategy_text)[:90]
+        filename = f"{signal_time.strftime('%Y%m%d_%H%M')}_{safe}_PENDING.png"
+        path = signal_directory / filename
+        fig.savefig(path, dpi=145, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        return str(path)
+    except Exception as exc:
+        print(f"WARNING: signal chart could not be saved: {exc}", file=sys.stderr)
+        return None
+
+
 def close_position(state, pos, price, timestamp, reason):
     move = price - pos["entry"]
     if pos["direction"] == "SELL":
@@ -301,7 +439,7 @@ def close_position(state, pos, price, timestamp, reason):
     event(state, "CLOSE", strategy=pos["strategy"], reason=reason, price=price,
           result_r=result_r, pnl=pnl, balance=state["balance"],
           bar_time=iso_time(timestamp), processing_mode=pos.get("processing_mode", "UNKNOWN"),
-          message=f"chart={chart_path}" if chart_path else None)
+          chart_path=chart_path, message=f"chart={chart_path}" if chart_path else None)
 
 
 def manage_positions(state, bar):
@@ -353,6 +491,7 @@ def process_pending(state, bar):
         if bar_time > expiry_time:
             state["pending"].remove(order)
             event(state, "PENDING_EXPIRED", strategy=order["strategy"],
+                  pending_entry=order.get("entry"), chart_path=order.get("signal_chart_path"),
                   bar_time=iso_time(bar.timestamp), processing_mode=order["processing_mode"])
             continue
         if order.get("entry_mode") == "next_open":
@@ -382,6 +521,7 @@ def process_pending(state, bar):
         event(state, "OPEN", strategy=order["strategy"], entry=order["entry"], sl=order["sl"],
               tp=order["tp"], risk_dollars=risk_dollars, stop_pips=stop_pips,
               target_pips=target_pips, estimated_lot=estimated_lot,
+              chart_path=order.get("signal_chart_path"),
               bar_time=iso_time(bar.timestamp), processing_mode=order["processing_mode"])
 
 
@@ -403,14 +543,18 @@ def find_signals(state, bar, strategies):
         wait_bars = 6 if pd.isna(wait_value) else int(wait_value)
         mode = bar_processing_mode(bar.timestamp)
         expiry_bars = wait_bars if entry_mode == "fib_touch" else 1
-        state["pending"].append({
+        pending_order = {
             "strategy": label, "direction": direction, "entry": level, "sl": sl, "tp": tp,
             "entry_mode": entry_mode, "rr": rr,
             "risk_distance": distance, "signal_bar_time": iso_time(bar.timestamp),
             "expires_bar_time": add_minutes(bar.timestamp, 15 * expiry_bars),
             "processing_mode": mode,
-        })
+        }
+        if mode == "LIVE":
+            pending_order["signal_chart_path"] = save_signal_chart(pending_order, bar.timestamp)
+        state["pending"].append(pending_order)
         event(state, "SIGNAL", strategy=label, entry_mode=entry_mode, pending_entry=level,
+              sl=sl, tp=tp, chart_path=pending_order.get("signal_chart_path"),
               bar_time=iso_time(bar.timestamp), processing_mode=mode,
               message=f"expires={add_minutes(bar.timestamp, 15 * expiry_bars)}")
 

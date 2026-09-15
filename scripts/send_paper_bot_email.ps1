@@ -2,7 +2,8 @@
 param(
     [string]$Subject,
     [string]$Body,
-    [string]$PayloadPath
+    [string]$PayloadPath,
+    [string]$AttachmentPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,9 @@ if ($PayloadPath) {
     $payload = Get-Content -LiteralPath $PayloadPath -Raw | ConvertFrom-Json
     $Subject = [string]$payload.subject
     $Body = [string]$payload.body
+    if ($payload.attachment_path) {
+        $AttachmentPath = [string]$payload.attachment_path
+    }
 }
 if ([string]::IsNullOrWhiteSpace($Subject)) {
     throw "Email subject is empty."
@@ -37,6 +41,14 @@ try {
     $mail.Subject = $Subject
     $mail.Body = $Body
     $mail.IsBodyHtml = $false
+    if (-not [string]::IsNullOrWhiteSpace($AttachmentPath)) {
+        if (Test-Path -LiteralPath $AttachmentPath) {
+            [void]$mail.Attachments.Add([System.Net.Mail.Attachment]::new($AttachmentPath))
+        }
+        else {
+            Write-Warning "Email attachment was not found: $AttachmentPath"
+        }
+    }
     $client.EnableSsl = $true
     $client.UseDefaultCredentials = $false
     $client.Credentials = $credential.GetNetworkCredential()
