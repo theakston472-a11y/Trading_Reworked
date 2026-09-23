@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $project = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $python = Join-Path $project ".venv\Scripts\python.exe"
 $bot = Join-Path $project "scripts\alpha_mt5_paper_bot.py"
-$shortlist = Join-Path $project "results\session_portfolio_research\best_session_paper_portfolio.csv"
+$shortlist = Join-Path $project "paper_bot_strategies.csv"
 $stateDirectory = Join-Path $project "results\alpha_mt5_paper"
 
 if (-not (Test-Path -LiteralPath $python)) {

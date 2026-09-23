@@ -1,0 +1,14 @@
+symbol,strategy_id,direction,session,conditions,rr,entry_mode,entry_wait_bars,engine_version,robust_score,source
+GBPUSD,NB03,BUY,New York,above_ema100+bullish_fib_382_rejection+bullish_fib_500_rejection+large_range,6.0,auto,6,2026-08-16-v9-directional-fib-gate,47.74912857285839,existing
+GBPUSD,AB02,BUY,Asia,bullish_fib_500_rejection+near_fib_500+small_range,5.1,auto,6,2026-08-16-v9-directional-fib-gate,60.05423311937364,existing
+GBPUSD,LB04,BUY,London,above_ema20+above_ema50+bullish_bos_fib_500,4.0,auto,6,2026-08-16-v9-directional-fib-gate,55.98435433630654,existing
+GBPUSD,AB01,BUY,Asia,bullish_candle+bullish_fib_500_rejection+near_fib_382+small_range,5.2,auto,6,2026-08-16-v9-directional-fib-gate,60.60187978871088,existing
+GBPUSD,AS01,SELL,Asia,above_ema200+bearish_fvg_retest+large_range,7.0,auto,6,2026-08-16-v9-directional-fib-gate,46.103332146062336,existing
+GBPUSD,LS01,SELL,London,bearish_choch+bearish_fvg,6.5,auto,6,2026-08-16-v9-directional-fib-gate,45.88048579884241,existing
+GBPUSD,NS01,SELL,New York,bearish_fib_618_rejection+small_range,2.0,auto,6,2026-08-16-v9-directional-fib-gate,46.88844386069119,existing
+GBPJPY,GJ01,BUY,Asia,bullish_fib_618_rejection+bullish_pin_bar,6.0,auto,6,2026-08-16-v9-directional-fib-gate,63.82122308018528,new
+GBPJPY,GJ02,SELL,Asia,above_ema20+bearish_engulfing+bearish_fib_500_rejection,4.1,auto,6,2026-08-16-v9-directional-fib-gate,61.21559594528098,new
+AUDUSD,AU01,SELL,Asia,above_ema20+bearish_bos_fib_618,4.9,auto,6,2026-08-16-v9-directional-fib-gate,60.56751157396715,new
+GBPJPY,GJ03,SELL,Asia,above_ema20+above_ema200+above_ema50+bearish_fib_liquidity,3.5,auto,6,2026-08-16-v9-directional-fib-gate,59.65178017191287,new
+AUDUSD,AU02,BUY,London,bullish_bos+bullish_fvg,6.2,auto,6,2026-08-16-v9-directional-fib-gate,59.59894498045372,new
+GBPJPY,GJ04,SELL,Asia,above_ema200+bearish_fib_liquidity+liquidity_sweep_high,3.5,auto,6,2026-08-16-v9-directional-fib-gate,54.49253961744829,new

@@ -1,4 +1,4 @@
-"""MT5-backed GBPUSD paper bot for the funded shortlist.
+"""MT5-backed multi-symbol paper bot for the funded shortlist.
 
 Paper-only: this program reads MT5 prices but never sends broker orders.
 It maintains a local ledger and enforces the agreed Alpha Pro controls.
@@ -37,11 +37,11 @@ STAGES = {
     "QUALIFIED": {"risk": 0.005, "target": None},
 }
 MAGIC = 260818
-PIP_SIZE = 0.0001
+DEFAULT_PIP_SIZE = 0.0001
 LIVE_BAR_MAX_AGE_MINUTES = 35
 EVENT_JOURNAL = None
 CHART_DIR = None
-FEATURE_CACHE = None
+FEATURE_CACHES = {}
 EMAIL_STATE_DIR = None
 JOURNAL_FIELDS = [
     "time", "kind", "processing_mode", "bar_time", "strategy", "reason",
@@ -53,7 +53,7 @@ JOURNAL_FIELDS = [
 
 def cli():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--symbol", default="GBPUSD")
+    p.add_argument("--symbol", default="GBPUSD", help="Fallback symbol for an older shortlist without a symbol column")
     p.add_argument("--terminal-path", type=Path, default=DEFAULT_MT5_TERMINAL)
     p.add_argument("--shortlist", type=Path, default=ROOT / "results" / "funded_strategy_shortlist.csv")
     p.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
@@ -65,6 +65,48 @@ def cli():
     p.add_argument("--no-charts", action="store_true", help="Disable automatic PNG charts when trades close")
     p.add_argument("--self-test", action="store_true")
     return p.parse_args()
+
+
+def pip_size_for(symbol):
+    return 0.01 if str(symbol).upper().endswith("JPY") else DEFAULT_PIP_SIZE
+
+
+def normalized_symbol(value):
+    return "".join(character for character in str(value).upper() if character.isalnum())
+
+
+def resolve_symbol(mt5, requested):
+    requested = str(requested).strip()
+    if mt5.symbol_info(requested) is not None:
+        return requested
+    wanted = normalized_symbol(requested)
+    exact = []
+    prefixed = []
+    for item in mt5.symbols_get() or []:
+        name = str(getattr(item, "name", ""))
+        normalized = normalized_symbol(name)
+        if normalized == wanted:
+            exact.append(name)
+        elif normalized.startswith(wanted):
+            prefixed.append(name)
+    matches = exact or prefixed
+    if not matches:
+        raise RuntimeError(f"MT5 does not provide a symbol matching {requested!r}")
+    return sorted(matches, key=lambda name: (len(name), name))[0]
+
+
+def pip_value_per_lot(mt5, symbol, price, pip_size=None):
+    """Return account-currency value of one pip for one lot."""
+    pip_size = float(pip_size or pip_size_for(symbol))
+    try:
+        value = mt5.order_calc_profit(
+            mt5.ORDER_TYPE_BUY, str(symbol), 1.0, float(price), float(price) + pip_size
+        )
+        if value is not None and math.isfinite(float(value)) and abs(float(value)) > 0:
+            return abs(float(value))
+    except Exception:
+        pass
+    return 10.0
 
 
 def atomic_json(value, path):
@@ -79,6 +121,7 @@ def initial_state():
         "account_start_balance": 10000.0,
         "personal_daily_limit": 0.03,
         "broker_day": None, "last_bar_time": None, "trading_days": [],
+        "last_bar_times": {}, "last_prices": {},
         "positions": [], "pending": [], "events": [], "locked": False,
         "lock_reason": None, "last_daily_email_date": None,
     }
@@ -91,6 +134,20 @@ def load_state(folder):
     defaults = initial_state()
     for key, value in defaults.items():
         state.setdefault(key, value)
+    if not isinstance(state.get("last_bar_times"), dict):
+        state["last_bar_times"] = {}
+    if state.get("last_bar_time") and "GBPUSD" not in state["last_bar_times"]:
+        state["last_bar_times"]["GBPUSD"] = state["last_bar_time"]
+    if not isinstance(state.get("last_prices"), dict):
+        state["last_prices"] = {}
+    for collection in ("positions", "pending"):
+        for item in state.get(collection, []):
+            item.setdefault("symbol", "GBPUSD")
+            item.setdefault("pip_size", pip_size_for(item["symbol"]))
+            item.setdefault("pip_value_per_lot", 10.0)
+            label = str(item.get("strategy", ""))
+            if label.count("|") == 3:
+                item["strategy"] = f"{item['symbol']}|{label}"
     return state, path
 
 
@@ -131,9 +188,13 @@ def broker_day(timestamp):
     return (pd.Timestamp(timestamp) + pd.Timedelta(hours=3)).date().isoformat()
 
 
-def equity(state, price):
+def equity(state, prices):
+    if not isinstance(prices, dict):
+        prices = {str(pos.get("symbol", "GBPUSD")): float(prices) for pos in state["positions"]}
     floating = 0.0
     for pos in state["positions"]:
+        symbol = str(pos.get("symbol", "GBPUSD"))
+        price = float(prices.get(symbol, pos.get("last_price", pos["entry"])))
         move = price - pos["entry"]
         if pos["direction"] == "SELL":
             move = -move
@@ -141,10 +202,10 @@ def equity(state, price):
     return state["balance"] + floating
 
 
-def risk_allowed(state, price):
+def risk_allowed(state, prices):
     if state["locked"] or len(state["positions"]) >= 2:
         return False, "locked or two positions already open"
-    loss = state["day_start_balance"] - equity(state, price)
+    loss = state["day_start_balance"] - equity(state, prices)
     planned = state["balance"] * STAGES[state["stage"]]["risk"]
     daily_limit = float(state.get("personal_daily_limit", 0.03))
     if loss + planned > state["day_start_balance"] * daily_limit + 1e-9:
@@ -188,7 +249,8 @@ def refresh_day(state, timestamp, processing_mode=None):
 
 def save_trade_chart(pos, exit_time, exit_price, reason):
     """Save a compact audit chart. A chart failure must never stop trading."""
-    if CHART_DIR is None or FEATURE_CACHE is None:
+    frame = FEATURE_CACHES.get(str(pos.get("symbol", "GBPUSD")))
+    if CHART_DIR is None or frame is None:
         return None
     try:
         import matplotlib
@@ -196,7 +258,6 @@ def save_trade_chart(pos, exit_time, exit_price, reason):
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
 
-        frame = FEATURE_CACHE
         signal_time = pd.Timestamp(pos.get("signal_bar_time", pos["entry_bar_time"]))
         end_time = pd.Timestamp(exit_time)
         before = signal_time - pd.Timedelta(hours=5)
@@ -211,7 +272,7 @@ def save_trade_chart(pos, exit_time, exit_price, reason):
             colour = "#22c55e" if row.close >= row.open else "#ef4444"
             ax.vlines(i, row.low, row.high, color=colour, linewidth=1)
             bottom = min(row.open, row.close)
-            height = max(abs(row.close - row.open), PIP_SIZE * 0.05)
+            height = max(abs(row.close - row.open), float(pos.get("pip_size", DEFAULT_PIP_SIZE)) * 0.05)
             ax.add_patch(Rectangle((i - 0.32, bottom), 0.64, height,
                                    facecolor=colour, edgecolor=colour, linewidth=0.7))
 
@@ -270,7 +331,7 @@ def save_trade_chart(pos, exit_time, exit_price, reason):
         ax.tick_params(colors="#d1d5db")
         for spine in ax.spines.values():
             spine.set_color("#475569")
-        title = f"{pos['strategy']} | {reason} | {pos.get('processing_mode', 'UNKNOWN')}"
+        title = f"{pos.get('symbol', 'GBPUSD')} | {pos['strategy']} | {reason} | {pos.get('processing_mode', 'UNKNOWN')}"
         ax.set_title(title, color="white", fontsize=11)
         ax.legend(facecolor="#17202b", labelcolor="white", loc="best")
         ax.grid(alpha=0.15)
@@ -289,7 +350,8 @@ def save_trade_chart(pos, exit_time, exit_price, reason):
 
 def save_signal_chart(order, signal_time):
     """Save a live pending-entry chart for attachment to the signal email."""
-    if CHART_DIR is None or FEATURE_CACHE is None:
+    frame = FEATURE_CACHES.get(str(order.get("symbol", "GBPUSD")))
+    if CHART_DIR is None or frame is None:
         return None
     try:
         import matplotlib
@@ -297,7 +359,6 @@ def save_signal_chart(order, signal_time):
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
 
-        frame = FEATURE_CACHE
         signal_time = pd.Timestamp(signal_time)
         chart = frame[frame["timestamp"] <= signal_time].tail(88).copy()
         if chart.empty:
@@ -318,13 +379,14 @@ def save_signal_chart(order, signal_time):
             colour = "#22c55e" if row.close >= row.open else "#ef4444"
             ax.vlines(i, row.low, row.high, color=colour, linewidth=1.0, zorder=2)
             bottom = min(row.open, row.close)
-            height = max(abs(row.close - row.open), PIP_SIZE * 0.05)
+            height = max(abs(row.close - row.open), float(order.get("pip_size", DEFAULT_PIP_SIZE)) * 0.05)
             ax.add_patch(Rectangle((i - 0.32, bottom), 0.64, height,
                                    facecolor=colour, edgecolor=colour,
                                    linewidth=0.7, zorder=3))
 
         strategy_text = str(order["strategy"])
-        conditions = strategy_text.split("|")[2] if strategy_text.count("|") >= 2 else strategy_text
+        label_parts = strategy_text.split("|")
+        conditions = label_parts[-2] if len(label_parts) >= 3 else strategy_text
         for ema_number, colour in ((20, "#38bdf8"), (100, "#f59e0b"), (200, "#c084fc")):
             ema_column = f"ema{ema_number}"
             if f"ema{ema_number}" in conditions.lower() and ema_column in chart.columns:
@@ -373,7 +435,7 @@ def save_signal_chart(order, signal_time):
                            alpha=0.65, label=f"SL {sl:.5f}")
                 ax.axhline(tp, color="#22c55e", linewidth=1.2, linestyle=":",
                            alpha=0.65, label=f"TP {tp:.5f} ({order['rr']:g}R)")
-                distance_pips = abs(current_price - entry) / PIP_SIZE
+                distance_pips = abs(current_price - entry) / float(order.get("pip_size", DEFAULT_PIP_SIZE))
                 ax.annotate(f"Waiting: {distance_pips:.1f} pips to entry",
                             xy=(signal_x, entry), xytext=(max(0, signal_x - 22), entry),
                             color="#fde68a", fontsize=10,
@@ -391,11 +453,10 @@ def save_signal_chart(order, signal_time):
         for spine in ax.spines.values():
             spine.set_color("#334155")
         ax.grid(alpha=0.12, linestyle=":")
-        label_parts = strategy_text.split("|")
-        session_name = label_parts[1] if len(label_parts) > 1 else "Unknown session"
+        session_name = label_parts[-3] if len(label_parts) >= 4 else "Unknown session"
         chart_status = str(order.get("chart_status", "PENDING"))
         ax.set_title(
-            f"{chart_status} {order['direction']} | {session_name} | {order['rr']:g}R target | "
+            f"{order.get('symbol', 'GBPUSD')} | {chart_status} {order['direction']} | {session_name} | {order['rr']:g}R target | "
             f"setup {signal_time.strftime('%d %b %H:%M')} UTC",
             color="white", fontsize=11,
         )
@@ -437,14 +498,17 @@ def close_position(state, pos, price, timestamp, reason):
     if day not in state["trading_days"]:
         state["trading_days"].append(day)
     chart_path = save_trade_chart(pos, timestamp, price, reason)
-    event(state, "CLOSE", strategy=pos["strategy"], reason=reason, price=price,
+    event(state, "CLOSE", symbol=pos.get("symbol", "GBPUSD"), strategy=pos["strategy"], reason=reason, price=price,
           result_r=result_r, pnl=pnl, balance=state["balance"],
           bar_time=iso_time(timestamp), processing_mode=pos.get("processing_mode", "UNKNOWN"),
           chart_path=chart_path, message=f"chart={chart_path}" if chart_path else None)
 
 
-def manage_positions(state, bar):
+def manage_positions(state, bar, symbol):
     for pos in list(state["positions"]):
+        if str(pos.get("symbol", "GBPUSD")) != str(symbol):
+            continue
+        pos["last_price"] = float(bar.close)
         if pos["direction"] == "BUY":
             stop_hit, target_hit = bar.low <= pos["sl"], bar.high >= pos["tp"]
         else:
@@ -457,35 +521,42 @@ def manage_positions(state, bar):
             close_position(state, pos, float(bar.close), bar.timestamp, "TIME")
 
 
-def enforce_controls(state, price, timestamp):
+def enforce_controls(state, prices, timestamp):
     stage = STAGES[state["stage"]]
-    current_equity = equity(state, price)
-    if stage["target"] is not None and current_equity >= stage["target"]:
+    current_equity = equity(state, prices)
+
+    def close_all(reason):
         for pos in list(state["positions"]):
-            close_position(state, pos, price, timestamp, "PHASE_PROFIT_LOCK")
+            symbol = str(pos.get("symbol", "GBPUSD"))
+            price = float(prices.get(symbol, pos.get("last_price", pos["entry"])))
+            close_position(state, pos, price, timestamp, reason)
+
+    if stage["target"] is not None and current_equity >= stage["target"]:
+        close_all("PHASE_PROFIT_LOCK")
         state["locked"] = True
         state["lock_reason"] = "PHASE_TARGET"
         event(state, "PHASE_LOCKED", stage=state["stage"], balance=state["balance"])
     daily_limit = float(state.get("personal_daily_limit", 0.03))
     if state["day_start_balance"] - current_equity >= state["day_start_balance"] * daily_limit:
-        for pos in list(state["positions"]):
-            close_position(state, pos, price, timestamp, "PERSONAL_DAILY_STOP")
+        close_all("PERSONAL_DAILY_STOP")
         state["locked"] = True
         state["lock_reason"] = "DAILY_LIMIT"
         event(state, "DAILY_LOCK", balance=state["balance"], bar_time=iso_time(timestamp),
               processing_mode=bar_processing_mode(timestamp))
     hard_floor = float(state.get("account_start_balance", 10000.0)) * 0.90
     if current_equity <= hard_floor and not state["locked"]:
-        for pos in list(state["positions"]):
-            close_position(state, pos, price, timestamp, "HARD_MAX_LOSS")
+        close_all("HARD_MAX_LOSS")
         state["locked"] = True
         state["lock_reason"] = "HARD_MAX_LOSS"
         event(state, "HARD_MAX_LOSS_LOCK", balance=state["balance"],
               bar_time=iso_time(timestamp), processing_mode=bar_processing_mode(timestamp))
 
 
-def process_pending(state, bar):
+def process_pending(state, bar, symbol, mt5=None, broker_symbol=None):
     for order in list(state["pending"]):
+        if str(order.get("symbol", "GBPUSD")) != str(symbol):
+            continue
+        order.setdefault("symbol", str(symbol))
         bar_time = pd.Timestamp(bar.timestamp)
         signal_time = pd.Timestamp(order["signal_bar_time"])
         expiry_time = pd.Timestamp(order["expires_bar_time"])
@@ -507,31 +578,43 @@ def process_pending(state, bar):
                 order["tp"] = order["entry"] - order["risk_distance"] * order["rr"]
         elif bar_time <= signal_time or not (bar.low <= order["entry"] <= bar.high):
             continue
-        allowed, reason = risk_allowed(state, order["entry"])
+        prices = dict(state.get("last_prices", {}))
+        prices[str(symbol)] = float(order["entry"])
+        allowed, reason = risk_allowed(state, prices)
         state["pending"].remove(order)
         if not allowed:
-            event(state, "ENTRY_BLOCKED", strategy=order["strategy"], reason=reason,
+            event(state, "ENTRY_BLOCKED", symbol=symbol, strategy=order["strategy"], reason=reason,
                   bar_time=iso_time(bar.timestamp), processing_mode=order["processing_mode"])
             continue
         risk_dollars = state["balance"] * STAGES[state["stage"]]["risk"]
-        stop_pips = order["risk_distance"] / PIP_SIZE
+        pip_size = float(order.get("pip_size", pip_size_for(symbol)))
+        pip_value = float(order.get("pip_value_per_lot", 10.0))
+        if mt5 is not None and broker_symbol is not None:
+            pip_value = pip_value_per_lot(mt5, broker_symbol, order["entry"], pip_size)
+        stop_pips = order["risk_distance"] / pip_size
         target_pips = stop_pips * order["rr"]
-        estimated_lot = risk_dollars / (stop_pips * 10.0) if stop_pips > 0 else 0.0
-        order.update({"risk_dollars": risk_dollars, "entry_bar_time": iso_time(bar.timestamp)})
+        estimated_lot = risk_dollars / (stop_pips * pip_value) if stop_pips > 0 and pip_value > 0 else 0.0
+        order.update({
+            "risk_dollars": risk_dollars,
+            "entry_bar_time": iso_time(bar.timestamp),
+            "last_price": float(order["entry"]),
+            "pip_size": pip_size,
+            "pip_value_per_lot": pip_value,
+        })
         state["positions"].append(order)
-        event(state, "OPEN", strategy=order["strategy"], entry=order["entry"], sl=order["sl"],
+        event(state, "OPEN", symbol=symbol, strategy=order["strategy"], entry=order["entry"], sl=order["sl"],
               tp=order["tp"], risk_dollars=risk_dollars, stop_pips=stop_pips,
               target_pips=target_pips, estimated_lot=estimated_lot,
               chart_path=order.get("signal_chart_path"),
               bar_time=iso_time(bar.timestamp), processing_mode=order["processing_mode"])
 
 
-def find_signals(state, bar, strategies):
+def find_signals(state, bar, strategies, symbol):
     for _, strategy in strategies.iterrows():
         if not matches(bar._asdict(), strategy):
             continue
         level = fib_level(bar._asdict(), strategy["conditions"])
-        label = f"{strategy['direction']}|{strategy['session']}|{strategy['conditions']}|RR{strategy['rr']:g}"
+        label = f"{symbol}|{strategy['direction']}|{strategy['session']}|{strategy['conditions']}|RR{strategy['rr']:g}"
         if any(x["strategy"] == label for x in state["pending"] + state["positions"]):
             continue
         distance = max(float(bar.atr14), abs(float(bar.high) - float(bar.low)))
@@ -545,16 +628,17 @@ def find_signals(state, bar, strategies):
         mode = bar_processing_mode(bar.timestamp)
         expiry_bars = wait_bars if entry_mode == "fib_touch" else 1
         pending_order = {
-            "strategy": label, "direction": direction, "entry": level, "sl": sl, "tp": tp,
+            "symbol": symbol, "strategy": label, "direction": direction,
+            "entry": level, "sl": sl, "tp": tp,
             "entry_mode": entry_mode, "rr": rr,
             "risk_distance": distance, "signal_bar_time": iso_time(bar.timestamp),
             "expires_bar_time": add_minutes(bar.timestamp, 15 * expiry_bars),
-            "processing_mode": mode,
+            "processing_mode": mode, "pip_size": pip_size_for(symbol),
         }
         if mode == "LIVE":
             pending_order["signal_chart_path"] = save_signal_chart(pending_order, bar.timestamp)
         state["pending"].append(pending_order)
-        event(state, "SIGNAL", strategy=label, entry_mode=entry_mode, pending_entry=level,
+        event(state, "SIGNAL", symbol=symbol, strategy=label, entry_mode=entry_mode, pending_entry=level,
               sl=sl, tp=tp, chart_path=pending_order.get("signal_chart_path"),
               bar_time=iso_time(bar.timestamp), processing_mode=mode,
               message=f"expires={add_minutes(bar.timestamp, 15 * expiry_bars)}")
@@ -574,10 +658,11 @@ def connect_mt5(terminal_path=None):
     return mt5
 
 
-def get_features(mt5, symbol, state_dir):
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 12000)
+def get_features(mt5, broker_symbol, state_dir, symbol=None):
+    symbol = str(symbol or broker_symbol)
+    rates = mt5.copy_rates_from_pos(broker_symbol, mt5.TIMEFRAME_M15, 0, 12000)
     if rates is None or len(rates) < 500:
-        raise RuntimeError(f"Not enough MT5 bars for {symbol}: {mt5.last_error()}")
+        raise RuntimeError(f"Not enough MT5 bars for {symbol} ({broker_symbol}): {mt5.last_error()}")
     raw = pd.DataFrame(rates)
     raw["timestamp"] = pd.to_datetime(raw["time"], unit="s", utc=True)
     # Some MT5 broker terminals expose candle epochs shifted to broker-local
@@ -589,8 +674,10 @@ def get_features(mt5, symbol, state_dir):
     if 1 <= abs(rounded_drift) <= 14 and abs(drift_hours - rounded_drift) <= 0.35:
         raw["timestamp"] = raw["timestamp"] - pd.Timedelta(hours=rounded_drift)
         print(f"Normalized MT5 candle timestamps by {-rounded_drift:+d}h to UTC", flush=True)
-    raw_path = state_dir / "mt5_bars.csv"
+    raw_path = state_dir / f"mt5_bars_{symbol}.csv"
     raw[["timestamp", "open", "high", "low", "close"]].to_csv(raw_path, index=False)
+    if symbol == "GBPUSD":
+        raw[["timestamp", "open", "high", "low", "close"]].to_csv(state_dir / "mt5_bars.csv", index=False)
     sys.path.insert(0, str(ROOT))
     from quant.feature_engine import build_features
     with warnings.catch_warnings():
@@ -602,13 +689,15 @@ def get_features(mt5, symbol, state_dir):
     return features.iloc[:-1].reset_index(drop=True)  # exclude still-forming candle
 
 
-def write_health(state_dir, state, latest_bar):
+def write_health(state_dir, state, latest_bars):
     now = pd.Timestamp.now(tz="UTC")
-    latest = pd.Timestamp(latest_bar)
+    bars = {str(symbol): pd.Timestamp(value) for symbol, value in latest_bars.items()}
+    oldest = min(bars.values())
     health = {
         "checked_at": now.isoformat(),
-        "last_closed_bar": latest.isoformat(),
-        "bar_lag_minutes": round((now - latest).total_seconds() / 60.0, 2),
+        "last_closed_bar": oldest.isoformat(),
+        "last_closed_bars": {symbol: value.isoformat() for symbol, value in bars.items()},
+        "bar_lag_minutes": round(max((now - value).total_seconds() / 60.0 for value in bars.values()), 2),
         "stage": state["stage"],
         "balance": state["balance"],
         "open_positions": len(state["positions"]),
@@ -640,6 +729,8 @@ def print_saved_status(state, state_dir):
     print(f"Stage: {state['stage']}")
     print(f"Paper balance: ${state['balance']:,.2f}")
     print(f"Last processed candle: {state.get('last_bar_time')}")
+    for symbol, timestamp in sorted(state.get("last_bar_times", {}).items()):
+        print(f"  {symbol}: {timestamp}")
     print(f"Open positions: {len(state['positions'])}")
     print(f"Pending entries: {len(state['pending'])}")
     print(f"Closed trades: {len(closes)} (live {len(live)}, catch-up {len(catch_up)}, legacy {legacy})")
@@ -648,33 +739,61 @@ def print_saved_status(state, state_dir):
     print(f"Charts: {state_dir / 'charts'}")
 
 
-def cycle(args, state, state_path, mt5, strategies):
-    global FEATURE_CACHE
-    features = get_features(mt5, args.symbol, args.state_dir)
-    FEATURE_CACHE = features
-    features["sequence"] = range(len(features))
-    if state["last_bar_time"] is None:
-        state["last_bar_time"] = features.iloc[-1]["timestamp"].isoformat()
-        event(state, "INITIALIZED", last_closed_bar=state["last_bar_time"])
-        atomic_json(state, state_path)
-        return
-    unseen = features[features["timestamp"] > pd.Timestamp(state["last_bar_time"])]
-    for bar in unseen.itertuples(index=False):
+def cycle(args, state, state_path, mt5, strategies, symbol_map):
+    events_to_process = []
+    latest_bars = {}
+    symbol_order = {symbol: index for index, symbol in enumerate(symbol_map)}
+    for symbol, broker_symbol in symbol_map.items():
+        features = get_features(mt5, broker_symbol, args.state_dir, symbol)
+        features["sequence"] = range(len(features))
+        FEATURE_CACHES[symbol] = features
+        latest = pd.Timestamp(features.iloc[-1]["timestamp"])
+        latest_bars[symbol] = latest
+        last_bar = state["last_bar_times"].get(symbol)
+        if not last_bar:
+            state["last_bar_times"][symbol] = latest.isoformat()
+            state["last_prices"][symbol] = float(features.iloc[-1]["close"])
+            event(state, "INITIALIZED", symbol=symbol, last_closed_bar=latest.isoformat())
+            continue
+        if symbol not in state["last_prices"]:
+            known = features[features["timestamp"] <= pd.Timestamp(last_bar)]
+            state["last_prices"][symbol] = float(
+                known.iloc[-1]["close"] if not known.empty else features.iloc[-1]["close"]
+            )
+        unseen = features[features["timestamp"] > pd.Timestamp(last_bar)]
+        if unseen.empty:
+            state["last_prices"][symbol] = float(features.iloc[-1]["close"])
+        for bar in unseen.itertuples(index=False):
+            events_to_process.append((pd.Timestamp(bar.timestamp), symbol_order[symbol], symbol, broker_symbol, bar))
+
+    ordered_events = sorted(events_to_process, key=lambda item: (item[0], item[1]))
+    for index, (timestamp, _, symbol, broker_symbol, bar) in enumerate(ordered_events):
+        state["last_prices"][symbol] = float(bar.close)
         refresh_day(state, bar.timestamp, bar_processing_mode(bar.timestamp))
-        manage_positions(state, bar)
-        process_pending(state, bar)
-        find_signals(state, bar, strategies)
-        enforce_controls(state, float(bar.close), bar.timestamp)
-        state["last_bar_time"] = bar.timestamp.isoformat()
+        manage_positions(state, bar, symbol)
+        process_pending(state, bar, symbol, mt5, broker_symbol)
+        symbol_strategies = strategies[strategies["symbol"] == symbol]
+        find_signals(state, bar, symbol_strategies, symbol)
+        state["last_bar_times"][symbol] = bar.timestamp.isoformat()
+        next_timestamp = ordered_events[index + 1][0] if index + 1 < len(ordered_events) else None
+        if next_timestamp != timestamp:
+            enforce_controls(state, state["last_prices"], bar.timestamp)
+
+    if "GBPUSD" in state["last_bar_times"]:
+        state["last_bar_time"] = state["last_bar_times"]["GBPUSD"]
+    elif state["last_bar_times"]:
+        state["last_bar_time"] = max(state["last_bar_times"].values())
     atomic_json(state, state_path)
-    write_health(args.state_dir, state, features.iloc[-1]["timestamp"])
-    if maybe_send_daily_email(state, args.state_dir, features.iloc[-1]["timestamp"]):
+    write_health(args.state_dir, state, latest_bars)
+    newest_bar = max(latest_bars.values())
+    if maybe_send_daily_email(state, args.state_dir, newest_bar):
         atomic_json(state, state_path)
-    print(f"status stage={state['stage']} balance={state['balance']:.2f} equity={equity(state, float(features.iloc[-1]['close'])):.2f} open={len(state['positions'])} pending={len(state['pending'])} days={len(state['trading_days'])} locked={state['locked']}", flush=True)
+    print(f"status symbols={','.join(symbol_map)} stage={state['stage']} balance={state['balance']:.2f} equity={equity(state, state['last_prices']):.2f} open={len(state['positions'])} pending={len(state['pending'])} days={len(state['trading_days'])} locked={state['locked']}", flush=True)
 
 
 def self_test():
     from types import SimpleNamespace
+    from tempfile import TemporaryDirectory
     s = initial_state()
     s["broker_day"] = "2026-01-01"
     assert risk_allowed(s, 1.25)[0]
@@ -695,12 +814,53 @@ def self_test():
     }]
     next_bar = SimpleNamespace(timestamp=signal_time + pd.Timedelta(minutes=15),
                                open=1.25, high=1.251, low=1.249, close=1.25)
-    process_pending(s, next_bar)
+    process_pending(s, next_bar, "GBPUSD")
     assert len(s["positions"]) == 1 and not s["pending"]
+    assert s["positions"][0]["symbol"] == "GBPUSD"
+    multi = initial_state()
+    multi["positions"] = [
+        {"symbol": "GBPUSD", "strategy": "GBPUSD|TEST", "direction": "BUY", "entry": 1.25,
+         "sl": 1.24, "tp": 1.26, "risk_distance": 0.01, "risk_dollars": 100.0,
+         "entry_bar_time": signal_time.isoformat(), "processing_mode": "LIVE"},
+        {"symbol": "GBPJPY", "strategy": "GBPJPY|TEST", "direction": "BUY", "entry": 150.0,
+         "sl": 149.0, "tp": 151.0, "risk_distance": 1.0, "risk_dollars": 100.0,
+         "entry_bar_time": signal_time.isoformat(), "processing_mode": "LIVE"},
+    ]
+    gbp_bar = SimpleNamespace(timestamp=signal_time + pd.Timedelta(minutes=30),
+                              open=1.25, high=1.261, low=1.249, close=1.26)
+    manage_positions(multi, gbp_bar, "GBPUSD")
+    assert len(multi["positions"]) == 1 and multi["positions"][0]["symbol"] == "GBPJPY"
+    assert math.isclose(equity(multi, {"GBPJPY": 150.5}), 10150.0)
     s["positions"] = []
     s["locked"], s["lock_reason"], s["broker_day"] = True, "DAILY_LIMIT", "2026-01-05"
     refresh_day(s, pd.Timestamp("2026-01-06T01:00:00Z"), "LIVE")
     assert not s["locked"] and s["lock_reason"] is None
+    original_get_features = globals()["get_features"]
+    with TemporaryDirectory() as temporary:
+        folder = Path(temporary)
+        test_state = initial_state()
+        test_state["last_daily_email_date"] = datetime.now(ZoneInfo("Europe/London")).date().isoformat()
+        frames = {}
+        for index, symbol in enumerate(("GBPUSD", "GBPJPY", "AUDUSD")):
+            frames[symbol] = pd.DataFrame(
+                [{"timestamp": pd.Timestamp("2026-01-05T09:00:00Z"), "open": 1 + index,
+                  "high": 1.1 + index, "low": 0.9 + index, "close": 1.0 + index}]
+            )
+
+        def fake_features(_mt5, _broker_symbol, _state_dir, symbol=None):
+            return frames[str(symbol)].copy()
+
+        try:
+            globals()["get_features"] = fake_features
+            args = SimpleNamespace(state_dir=folder)
+            empty_strategies = pd.DataFrame(columns=["symbol", "direction", "session", "conditions", "rr"])
+            symbol_map = {symbol: symbol for symbol in frames}
+            cycle(args, test_state, folder / "state.json", object(), empty_strategies, symbol_map)
+            assert set(test_state["last_bar_times"]) == set(frames)
+            assert set(test_state["last_prices"]) == set(frames)
+            assert json.loads((folder / "health.json").read_text(encoding="utf-8"))["open_positions"] == 0
+        finally:
+            globals()["get_features"] = original_get_features
     print("SELF-TEST PASSED: risk, timestamp entries, daily reset, and state controls")
 
 
@@ -726,13 +886,28 @@ def main():
         print(f"stage set to {args.stage}; paper balance reset to {state['balance']:.2f}")
         return 0
     strategies = pd.read_csv(args.shortlist)
+    if "symbol" not in strategies.columns:
+        strategies.insert(0, "symbol", args.symbol)
+    strategies["symbol"] = strategies["symbol"].astype(str).str.strip().str.upper()
+    required = {"symbol", "direction", "session", "conditions", "rr"}
+    missing = sorted(required.difference(strategies.columns))
+    if missing:
+        raise RuntimeError(f"Shortlist is missing required columns: {', '.join(missing)}")
+    if "robust_score" in strategies.columns:
+        strategies = strategies.sort_values("robust_score", ascending=False, kind="stable").reset_index(drop=True)
     mt5 = connect_mt5(args.terminal_path)
     try:
+        symbol_map = {}
+        for symbol in strategies["symbol"].drop_duplicates():
+            broker_symbol = resolve_symbol(mt5, symbol)
+            if not mt5.symbol_select(broker_symbol, True):
+                raise RuntimeError(f"MT5 could not select {broker_symbol}: {mt5.last_error()}")
+            symbol_map[symbol] = broker_symbol
         event(state, "BOT_STARTED", balance=state["balance"],
-              message="MT5 connected; paper-only monitoring is active")
+              message=f"MT5 connected; paper-only monitoring is active for {', '.join(symbol_map)}")
         atomic_json(state, state_path)
         while True:
-            cycle(args, state, state_path, mt5, strategies)
+            cycle(args, state, state_path, mt5, strategies, symbol_map)
             if args.once:
                 break
             time.sleep(max(args.interval, 5))

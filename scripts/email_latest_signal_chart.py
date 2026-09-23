@@ -41,7 +41,9 @@ def parse_strategy(label):
     parts = str(label).split("|")
     if len(parts) < 4 or not parts[-1].upper().startswith("RR"):
         raise ValueError(f"Could not parse strategy label: {label}")
-    return parts[0].upper(), parts[1], parts[2], float(parts[-1][2:])
+    if len(parts) >= 5:
+        return parts[0].upper(), parts[-4].upper(), parts[-3], parts[-2], float(parts[-1][2:])
+    return "GBPUSD", parts[0].upper(), parts[1], parts[2], float(parts[-1][2:])
 
 
 def expiry_from_event(event, signal_time, entry_mode):
@@ -53,7 +55,7 @@ def expiry_from_event(event, signal_time, entry_mode):
 
 
 def reconstruct_order(event, signal_row):
-    direction, _session, conditions, rr = parse_strategy(event["strategy"])
+    symbol, direction, _session, conditions, rr = parse_strategy(event["strategy"])
     entry_mode = event.get("entry_mode") or "fib_touch"
     entry = event.get("pending_entry")
     if entry is None and entry_mode == "fib_touch":
@@ -68,6 +70,7 @@ def reconstruct_order(event, signal_row):
         tp = float(tp) if tp is not None else entry + (risk_distance * rr if direction == "BUY" else -risk_distance * rr)
     signal_time = event_time(event)
     return {
+        "symbol": event.get("symbol", symbol),
         "strategy": event["strategy"],
         "direction": direction,
         "entry": entry,
@@ -104,8 +107,9 @@ def signal_status(state, signal_event):
     return "SIGNAL"
 
 
-def load_features(state_dir):
-    raw_path = state_dir / "mt5_bars.csv"
+def load_features(state_dir, symbol="GBPUSD"):
+    symbol_path = state_dir / f"mt5_bars_{symbol}.csv"
+    raw_path = symbol_path if symbol_path.is_file() else state_dir / "mt5_bars.csv"
     if not raw_path.is_file():
         raise FileNotFoundError(f"Saved MT5 candles were not found: {raw_path}")
     from quant.feature_engine import build_features
@@ -131,6 +135,9 @@ def self_test():
     assert math.isclose(order["sl"], 1.3550)
     assert math.isclose(order["tp"], 1.3520)
     assert pd.Timestamp(order["expires_bar_time"]) == signal_time + pd.Timedelta(minutes=90)
+    assert parse_strategy("GBPJPY|SELL|Asia|bearish_fib_618_rejection|RR4.1") == (
+        "GBPJPY", "SELL", "Asia", "bearish_fib_618_rejection", 4.1
+    )
     print("SELF-TEST PASSED: latest signal reconstruction")
 
 
@@ -153,7 +160,8 @@ def main():
     if not signals:
         raise RuntimeError(f"No live paper-bot signal was recorded on {wanted_date}.")
     signal_event = signals[-1]
-    features = load_features(args.state_dir)
+    signal_symbol = str(signal_event.get("symbol") or parse_strategy(signal_event["strategy"])[0])
+    features = load_features(args.state_dir, signal_symbol)
     signal_time = event_time(signal_event)
     rows = features[features["timestamp"] == signal_time]
     if rows.empty:
@@ -161,7 +169,7 @@ def main():
     order = reconstruct_order(signal_event, rows.iloc[0])
     status = signal_status(state, signal_event)
     order["chart_status"] = status
-    bot.FEATURE_CACHE = features
+    bot.FEATURE_CACHES[signal_symbol] = features
     bot.CHART_DIR = args.state_dir / "charts"
     chart_path = bot.save_signal_chart(order, signal_time)
     if not chart_path:
