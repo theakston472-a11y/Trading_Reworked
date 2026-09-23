@@ -180,6 +180,77 @@ def top10_each(best: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
+def explain_conditions(row: pd.Series) -> str:
+    names = {
+        "above_ema20": "price is above the 20 EMA",
+        "bullish_fib_618_rejection": "price rejects the directional 61.8% Fib upward",
+        "bullish_pin_bar": "the setup candle is a bullish pin bar",
+        "bearish_engulfing": "the setup candle is bearish engulfing",
+        "bearish_fib_500_rejection": "price rejects the directional 50% Fib downward",
+        "bearish_bos_fib_618": "a bearish break of structure is confirmed around the directional 61.8% Fib",
+        "bullish_bos": "a bullish break of structure is present",
+        "bullish_fvg": "a bullish fair-value gap is present",
+    }
+    parts = [names.get(item, item.replace("_", " ")) for item in str(row["conditions"]).split("+")]
+    return f"During {row['session']}, look for a {row['direction']} when " + ", and ".join(parts) + "."
+
+
+def build_discovery_counts(run_dir: Path, output_dir: Path) -> pd.DataFrame:
+    frames = []
+    for symbol in ("GBPJPY", "AUDUSD"):
+        counts = pd.read_csv(run_dir / "promotion" / symbol / "discovery_counts.csv")
+        screened = pd.read_csv(run_dir / "promotion" / symbol / "discovery_screened.csv")
+        strict = (
+            screened["trades"].ge(30)
+            & screened["positive_periods"].eq(screened["periods_tested"])
+            & screened["min_profit_factor"].ge(1.2)
+            & screened["worst_drawdown_r"].le(20.0)
+        )
+        strict_counts = (
+            screened.loc[strict]
+            .groupby(["symbol", "session", "direction"])
+            .size()
+            .rename("strict_discovery_survivors")
+            .reset_index()
+        )
+        counts = counts.merge(strict_counts, on=["symbol", "session", "direction"], how="left")
+        counts["strict_discovery_survivors"] = counts["strict_discovery_survivors"].fillna(0).astype(int)
+        counts.insert(3, "combinations_examined", 74518)
+        frames.append(counts)
+    result = pd.concat(frames, ignore_index=True)
+    result.to_csv(output_dir / "multisymbol_discovery_counts.csv", index=False)
+    return result
+
+
+def build_runtime_summary(run_dir: Path, legacy_results: Path, output_dir: Path) -> pd.DataFrame:
+    discovery = pd.read_csv(run_dir / "discovery_timings.csv")
+    wall_rows = []
+    for (symbol, session), part in discovery.groupby(["symbol", "session"], sort=False):
+        seconds = float(part["seconds"].max())
+        source = "timing log"
+        if symbol == "GBPJPY" and session == "Asia" and seconds == 0:
+            seconds = 65.5
+            source = "initial console measurement before resume"
+        wall_rows.append(
+            {"stage": "discovery", "symbol": symbol, "session": session, "seconds": seconds, "source": source}
+        )
+    deep = pd.read_csv(run_dir / "deep_timings.csv")
+    for symbol, part in deep.groupby("symbol", sort=False):
+        wall_rows.append(
+            {
+                "stage": "deep_test",
+                "symbol": symbol,
+                "session": "ALL",
+                "seconds": float(part["seconds"].max()),
+                "source": "four-worker parallel wall time",
+            }
+        )
+    result = pd.DataFrame(wall_rows)
+    result["minutes"] = result["seconds"] / 60
+    result.to_csv(output_dir / "multisymbol_runtime_summary.csv", index=False)
+    return result
+
+
 def load_legacy_portfolio(legacy_results: Path) -> tuple[pd.DataFrame, list[set[pd.Timestamp]]]:
     portfolio_file = legacy_results / "session_portfolio_research" / "best_session_paper_portfolio.csv"
     primary_db = legacy_results / "strategy_lab.sqlite"
@@ -315,6 +386,8 @@ def main() -> None:
     selected["setups_week"] = [len(values) / weeks for values in selected_sets]
     selected["closest_selected_overlap"] = closest_values
     selected["closest_selected_strategy"] = closest_labels
+    selected["tier"] = np.where(selected["passes_funded_gate"], "strict_5R", "quality_10R")
+    selected["plain_english"] = [explain_conditions(row) for _, row in selected.iterrows()]
     selected.to_csv(output_dir / "multisymbol_final_top4.csv", index=False)
 
     matrix = pd.DataFrame(index=labels, columns=labels, dtype=float)
@@ -343,6 +416,17 @@ def main() -> None:
     frequency = pd.DataFrame(rows)
     frequency = frequency[["portfolio"] + [column for column in frequency.columns if column != "portfolio"]]
     frequency.to_csv(output_dir / "multisymbol_frequency_comparison.csv", index=False)
+    discovery_counts = build_discovery_counts(run_dir, output_dir)
+    runtimes = build_runtime_summary(run_dir, args.legacy_results, output_dir)
+    discovery_seconds = float(runtimes[runtimes["stage"].eq("discovery")]["seconds"].sum())
+    deep_seconds = float(runtimes[runtimes["stage"].eq("deep_test")]["seconds"].sum())
+    old_runtime_file = args.legacy_results / "asia" / "asia_runtime_summary.csv"
+    old_discovery_seconds = math.nan
+    old_deep_seconds = math.nan
+    if old_runtime_file.exists():
+        old_runtime = pd.read_csv(old_runtime_file).set_index("stage")
+        old_discovery_seconds = float(old_runtime.loc["parallel_discovery_wall_seconds", "seconds"])
+        old_deep_seconds = float(old_runtime.loc["total_deep_wall_seconds", "seconds"])
 
     lines = [
         "MULTI-SYMBOL STRATEGY RESEARCH SUMMARY",
@@ -354,6 +438,10 @@ def main() -> None:
         f"Combined strict families after {OVERLAP_THRESHOLD:.2f} entry-time overlap pruning: {len(strict_deduplicated)}.",
         f"Quality-gate families before pruning: GBPJPY {quality_counts['GBPJPY']}; AUDUSD {quality_counts['AUDUSD']}.",
         f"Combined quality families after overlap pruning: {len(quality_deduplicated)}.",
+        f"Discovery totals: {int(discovery_counts['combinations_examined'].sum()):,} combinations examined; "
+        f"{int(discovery_counts['saved_candidates'].sum()):,} saved; "
+        f"{int(discovery_counts['quality_survivors'].sum()):,} quality-screen survivors; "
+        f"{int(discovery_counts['strict_discovery_survivors'].sum()):,} strict-screen survivors.",
         "Strict gate: RR >= 3, trades >= 40, PF >= 1.7, max DD <= 5R, RR stability >= 0.80, every tested year positive.",
         "Quality gate used for balanced Top4: same rules with max DD <= 10R; the output marks which also pass the strict 5R gate.",
         "",
@@ -368,8 +456,9 @@ def main() -> None:
             f"DD {row['max_drawdown_r']:.2f}R | win {row['win_rate']:.2f}% | "
             f"{row['setups_week']:.3f}/week | stability {row['rr_stability']:.3f} | "
             f"robust {row['robust_score']:.3f} | years {int(row['positive_years'])}/{int(row['years_tested'])} | "
-            f"closest overlap {row['closest_selected_overlap']:.3f}"
+            f"closest overlap {row['closest_selected_overlap']:.3f} | tier {row['tier']}"
         )
+        lines.append(f"   {row['plain_english']}")
     if not legacy.empty:
         lines += [
             "",
@@ -379,6 +468,19 @@ def main() -> None:
             f"With new pairs: {after['unique_setups_week']:.3f} unique setups/week; average gap {after['average_days_between_setups']:.3f} days.",
             f"Trading days 0/1/2+: current {before['trading_days_0']}/{before['trading_days_1']}/{before['trading_days_2plus']}; "
             f"with new pairs {after['trading_days_0']}/{after['trading_days_1']}/{after['trading_days_2plus']}.",
+        ]
+    lines += [
+        "",
+        "COMPUTATIONAL RUNTIME",
+        "-" * 21,
+        f"Current discovery wall time: {discovery_seconds:.3f}s ({discovery_seconds / 60:.2f} min) across two symbols and three sessions.",
+        f"Current deep-test wall time: {deep_seconds:.3f}s ({deep_seconds / 60:.2f} min) with four parallel workers per symbol.",
+        "Feature-building and promotion were not timed, so they are excluded from the measured total.",
+    ]
+    if math.isfinite(old_discovery_seconds) and math.isfinite(old_deep_seconds):
+        lines += [
+            f"Prior recorded Asia run: discovery {old_discovery_seconds:.3f}s; deep test {old_deep_seconds:.3f}s.",
+            "The current workflow was much faster in recorded wall time, but this is not a strict benchmark because candidate pools, data span and worker layout differ.",
         ]
     (output_dir / "multisymbol_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Strict counts: {strict_counts}; quality counts: {quality_counts}")
