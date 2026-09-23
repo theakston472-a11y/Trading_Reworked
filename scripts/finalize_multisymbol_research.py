@@ -410,6 +410,14 @@ def main() -> None:
     before = frequency_metrics(legacy_sets, comparison_end)
     before["portfolio"] = "Current GBPUSD paper portfolio"
     rows.append(before)
+    strict_selected_sets = [
+        values
+        for values, passes in zip(selected_sets, selected["passes_funded_gate"].astype(bool))
+        if passes
+    ]
+    strict_after = frequency_metrics(legacy_sets + strict_selected_sets, comparison_end)
+    strict_after["portfolio"] = "Current portfolio + strict GBPJPY pair"
+    rows.append(strict_after)
     after = frequency_metrics(legacy_sets + selected_sets, comparison_end)
     after["portfolio"] = "Current GBPUSD portfolio + new pair Top4"
     rows.append(after)
@@ -465,8 +473,10 @@ def main() -> None:
             "OPPORTUNITY FREQUENCY",
             "-" * 21,
             f"Current portfolio: {before['unique_setups_week']:.3f} unique setups/week; average gap {before['average_days_between_setups']:.3f} days.",
+            f"With strict GBPJPY pair: {strict_after['unique_setups_week']:.3f} unique setups/week; average gap {strict_after['average_days_between_setups']:.3f} days.",
             f"With new pairs: {after['unique_setups_week']:.3f} unique setups/week; average gap {after['average_days_between_setups']:.3f} days.",
             f"Trading days 0/1/2+: current {before['trading_days_0']}/{before['trading_days_1']}/{before['trading_days_2plus']}; "
+            f"strict pair {strict_after['trading_days_0']}/{strict_after['trading_days_1']}/{strict_after['trading_days_2plus']}; "
             f"with new pairs {after['trading_days_0']}/{after['trading_days_1']}/{after['trading_days_2plus']}.",
         ]
     lines += [
