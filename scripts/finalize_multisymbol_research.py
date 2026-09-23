@@ -171,6 +171,45 @@ def select_balanced(candidates: pd.DataFrame, limit: int = 4) -> pd.DataFrame:
     return result
 
 
+def annotate_selection(
+    selected: pd.DataFrame,
+    trades: dict[tuple[str, ...], list[dict]],
+    weeks: float,
+    rank_name: str = "rank",
+) -> tuple[pd.DataFrame, list[set[pd.Timestamp]], pd.DataFrame]:
+    selected = ordered(selected).reset_index(drop=True)
+    annotation_columns = [
+        "rank", "plan_rank", "stored_entry_count", "setups_week",
+        "closest_selected_overlap", "closest_selected_strategy", "tier", "plain_english",
+    ]
+    selected = selected.drop(columns=[column for column in annotation_columns if column in selected.columns])
+    selected.insert(0, rank_name, range(1, len(selected) + 1))
+    sets = [entry_times(trades[strategy_key(row)]) for _, row in selected.iterrows()]
+    labels = [
+        f"#{int(row[rank_name])} {row['symbol']} {row['direction']} {row['session']}"
+        for _, row in selected.iterrows()
+    ]
+    closest_values = []
+    closest_labels = []
+    for index, left in enumerate(sets):
+        peers = [(other, overlap(left, right)) for other, right in enumerate(sets) if other != index]
+        other, value = max(peers, key=lambda item: item[1]) if peers else (-1, 0.0)
+        closest_values.append(value)
+        closest_labels.append(labels[other] if other >= 0 else "none")
+    selected["stored_entry_count"] = [len(values) for values in sets]
+    selected["setups_week"] = [len(values) / weeks for values in sets]
+    selected["closest_selected_overlap"] = closest_values
+    selected["closest_selected_strategy"] = closest_labels
+    selected["tier"] = np.where(selected["passes_funded_gate"], "strict_5R", "quality_10R")
+    selected["plain_english"] = [explain_conditions(row) for _, row in selected.iterrows()]
+    matrix = pd.DataFrame(index=labels, columns=labels, dtype=float)
+    for left_index, left in enumerate(sets):
+        for right_index, right in enumerate(sets):
+            matrix.iloc[left_index, right_index] = overlap(left, right)
+    matrix.index.name = "strategy"
+    return selected, sets, matrix
+
+
 def top10_each(best: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for direction in ("BUY", "SELL"):
@@ -367,35 +406,22 @@ def main() -> None:
     quality_deduplicated.to_csv(output_dir / "multisymbol_quality_deduplicated.csv", index=False)
     rejected.to_csv(output_dir / "multisymbol_overlap_rejections.csv", index=False)
     selected = select_balanced(quality_deduplicated, 4)
-
-    selected_sets = [entry_times(trade_map[strategy_key(row)]) for _, row in selected.iterrows()]
-    labels = [
-        f"#{int(row['rank'])} {row['symbol']} {row['direction']} {row['session']}"
-        for _, row in selected.iterrows()
-    ]
-    closest_values = []
-    closest_labels = []
-    for index, left in enumerate(selected_sets):
-        peers = [(other, overlap(left, right)) for other, right in enumerate(selected_sets) if other != index]
-        other, value = max(peers, key=lambda item: item[1]) if peers else (-1, 0.0)
-        closest_values.append(value)
-        closest_labels.append(labels[other] if other >= 0 else "none")
     end = latest_feature_timestamp(root, symbols)
     weeks = ((end.normalize() - START.normalize()).days + 1) / 7
-    selected["stored_entry_count"] = [len(values) for values in selected_sets]
-    selected["setups_week"] = [len(values) / weeks for values in selected_sets]
-    selected["closest_selected_overlap"] = closest_values
-    selected["closest_selected_strategy"] = closest_labels
-    selected["tier"] = np.where(selected["passes_funded_gate"], "strict_5R", "quality_10R")
-    selected["plain_english"] = [explain_conditions(row) for _, row in selected.iterrows()]
+    selected, selected_sets, matrix = annotate_selection(selected, trade_map, weeks)
     selected.to_csv(output_dir / "multisymbol_final_top4.csv", index=False)
-
-    matrix = pd.DataFrame(index=labels, columns=labels, dtype=float)
-    for left_index, left in enumerate(selected_sets):
-        for right_index, right in enumerate(selected_sets):
-            matrix.iloc[left_index, right_index] = overlap(left, right)
-    matrix.index.name = "strategy"
     matrix.to_csv(output_dir / "multisymbol_final_top4_overlap_matrix.csv")
+
+    six_source = pd.concat(
+        [
+            quality_deduplicated[quality_deduplicated["symbol"].eq("GBPJPY")].head(4),
+            selected[selected["symbol"].eq("AUDUSD")].head(2),
+        ],
+        ignore_index=True,
+    )
+    six_plan, six_sets, six_matrix = annotate_selection(six_source, trade_map, weeks, "plan_rank")
+    six_plan.to_csv(output_dir / "multisymbol_six_strategy_plan.csv", index=False)
+    six_matrix.to_csv(output_dir / "multisymbol_six_strategy_overlap_matrix.csv")
 
     legacy, legacy_sets = load_legacy_portfolio(args.legacy_results)
     comparison_end = end
@@ -421,6 +447,9 @@ def main() -> None:
     after = frequency_metrics(legacy_sets + selected_sets, comparison_end)
     after["portfolio"] = "Current GBPUSD portfolio + new pair Top4"
     rows.append(after)
+    six_after = frequency_metrics(legacy_sets + six_sets, comparison_end)
+    six_after["portfolio"] = "Current portfolio + six new strategies"
+    rows.append(six_after)
     frequency = pd.DataFrame(rows)
     frequency = frequency[["portfolio"] + [column for column in frequency.columns if column != "portfolio"]]
     frequency.to_csv(output_dir / "multisymbol_frequency_comparison.csv", index=False)
@@ -475,9 +504,11 @@ def main() -> None:
             f"Current portfolio: {before['unique_setups_week']:.3f} unique setups/week; average gap {before['average_days_between_setups']:.3f} days.",
             f"With strict GBPJPY pair: {strict_after['unique_setups_week']:.3f} unique setups/week; average gap {strict_after['average_days_between_setups']:.3f} days.",
             f"With new pairs: {after['unique_setups_week']:.3f} unique setups/week; average gap {after['average_days_between_setups']:.3f} days.",
+            f"With all six requested additions: {six_after['unique_setups_week']:.3f} unique setups/week; average gap {six_after['average_days_between_setups']:.3f} days.",
             f"Trading days 0/1/2+: current {before['trading_days_0']}/{before['trading_days_1']}/{before['trading_days_2plus']}; "
             f"strict pair {strict_after['trading_days_0']}/{strict_after['trading_days_1']}/{strict_after['trading_days_2plus']}; "
-            f"with new pairs {after['trading_days_0']}/{after['trading_days_1']}/{after['trading_days_2plus']}.",
+            f"with new pairs {after['trading_days_0']}/{after['trading_days_1']}/{after['trading_days_2plus']}; "
+            f"with six {six_after['trading_days_0']}/{six_after['trading_days_1']}/{six_after['trading_days_2plus']}.",
         ]
     lines += [
         "",
