@@ -22,6 +22,7 @@ INTERESTING_EVENTS = {
     "OPEN",
     "CLOSE",
     "PHASE_LOCKED",
+    "PHASE_PASSED",
     "DAILY_LOCK",
     "HARD_MAX_LOSS_LOCK",
 }

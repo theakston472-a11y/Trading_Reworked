@@ -32,10 +32,11 @@ DEFAULT_MT5_TERMINAL = Path(
     os.environ.get("MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5\terminal64.exe")
 )
 STAGES = {
-    "PHASE_1": {"risk": 0.01, "target": 11020.0},
+    "PHASE_1": {"risk": 0.01, "target": 11030.0},
     "PHASE_2": {"risk": 0.01, "target": 10520.0},
     "QUALIFIED": {"risk": 0.005, "target": None},
 }
+PHASE_START_BALANCE = 10000.0
 MAGIC = 260818
 DEFAULT_PIP_SIZE = 0.0001
 LIVE_BAR_MAX_AGE_MINUTES = 35
@@ -117,13 +118,14 @@ def atomic_json(value, path):
 
 def initial_state():
     return {
-        "stage": "PHASE_1", "balance": 10000.0, "day_start_balance": 10000.0,
-        "account_start_balance": 10000.0,
+        "stage": "PHASE_1", "balance": PHASE_START_BALANCE,
+        "day_start_balance": PHASE_START_BALANCE,
+        "account_start_balance": PHASE_START_BALANCE,
         "personal_daily_limit": 0.03,
         "broker_day": None, "last_bar_time": None, "trading_days": [],
         "last_bar_times": {}, "last_prices": {},
         "positions": [], "pending": [], "events": [], "locked": False,
-        "lock_reason": None, "last_daily_email_date": None,
+        "lock_reason": None, "last_daily_email_date": None, "phase_history": [],
     }
 
 
@@ -504,6 +506,60 @@ def close_position(state, pos, price, timestamp, reason):
           chart_path=chart_path, message=f"chart={chart_path}" if chart_path else None)
 
 
+def advance_completed_phase(state, timestamp, target):
+    """Record a pass and immediately start the next paper-account phase."""
+    completed_stage = str(state["stage"])
+    next_stage = "PHASE_2" if completed_stage == "PHASE_1" else "QUALIFIED"
+    actual_balance = float(state["balance"])
+    overshoot = max(0.0, actual_balance - float(target))
+    cancelled_pending = len(state["pending"])
+    state["pending"].clear()
+    record = {
+        "stage": completed_stage,
+        "next_stage": next_stage,
+        "passed_at": iso_time(timestamp),
+        "target": float(target),
+        "credited_balance": float(target),
+        "actual_close_balance": actual_balance,
+        "overshoot": overshoot,
+        "cancelled_pending": cancelled_pending,
+    }
+    state.setdefault("phase_history", []).append(record)
+    state["phase_history"] = state["phase_history"][-100:]
+    event(
+        state,
+        "PHASE_PASSED",
+        stage=completed_stage,
+        next_stage=next_stage,
+        target=float(target),
+        balance=actual_balance,
+        overshoot=overshoot,
+        bar_time=iso_time(timestamp),
+        processing_mode=bar_processing_mode(timestamp),
+        message=(
+            f"{completed_stage} passed at the ${target:,.2f} safety threshold; "
+            f"{next_stage} starts immediately at ${PHASE_START_BALANCE:,.2f}. "
+            f"Cancelled pending entries: {cancelled_pending}."
+        ),
+    )
+    state["stage"] = next_stage
+    state["balance"] = PHASE_START_BALANCE
+    state["day_start_balance"] = PHASE_START_BALANCE
+    state["account_start_balance"] = PHASE_START_BALANCE
+    state["locked"] = False
+    state["lock_reason"] = None
+    state["broker_day"] = broker_day(timestamp)
+    event(
+        state,
+        "PHASE_STARTED",
+        stage=next_stage,
+        balance=state["balance"],
+        bar_time=iso_time(timestamp),
+        processing_mode=bar_processing_mode(timestamp),
+        message=f"{next_stage} is active immediately.",
+    )
+
+
 def manage_positions(state, bar, symbol):
     for pos in list(state["positions"]):
         if str(pos.get("symbol", "GBPUSD")) != str(symbol):
@@ -533,9 +589,8 @@ def enforce_controls(state, prices, timestamp):
 
     if stage["target"] is not None and current_equity >= stage["target"]:
         close_all("PHASE_PROFIT_LOCK")
-        state["locked"] = True
-        state["lock_reason"] = "PHASE_TARGET"
-        event(state, "PHASE_LOCKED", stage=state["stage"], balance=state["balance"])
+        advance_completed_phase(state, timestamp, stage["target"])
+        return True
     daily_limit = float(state.get("personal_daily_limit", 0.03))
     if state["day_start_balance"] - current_equity >= state["day_start_balance"] * daily_limit:
         close_all("PERSONAL_DAILY_STOP")
@@ -550,6 +605,7 @@ def enforce_controls(state, prices, timestamp):
         state["lock_reason"] = "HARD_MAX_LOSS"
         event(state, "HARD_MAX_LOSS_LOCK", balance=state["balance"],
               bar_time=iso_time(timestamp), processing_mode=bar_processing_mode(timestamp))
+    return False
 
 
 def process_pending(state, bar, symbol, mt5=None, broker_symbol=None):
@@ -658,6 +714,25 @@ def connect_mt5(terminal_path=None):
     return mt5
 
 
+def current_tick_prices(mt5, symbol_map, fallback_prices):
+    """Return fresh midpoint marks so the phase target is checked every loop."""
+    prices = dict(fallback_prices or {})
+    for symbol, broker_symbol in symbol_map.items():
+        try:
+            tick = mt5.symbol_info_tick(broker_symbol)
+        except Exception:
+            tick = None
+        if tick is None:
+            continue
+        bid = float(getattr(tick, "bid", 0.0) or 0.0)
+        ask = float(getattr(tick, "ask", 0.0) or 0.0)
+        if bid > 0 and ask > 0:
+            prices[str(symbol)] = (bid + ask) / 2.0
+        elif bid > 0 or ask > 0:
+            prices[str(symbol)] = bid or ask
+    return prices
+
+
 def get_features(mt5, broker_symbol, state_dir, symbol=None):
     symbol = str(symbol or broker_symbol)
     rates = mt5.copy_rates_from_pos(broker_symbol, mt5.TIMEFRAME_M15, 0, 12000)
@@ -699,6 +774,8 @@ def write_health(state_dir, state, latest_bars):
         "last_closed_bars": {symbol: value.isoformat() for symbol, value in bars.items()},
         "bar_lag_minutes": round(max((now - value).total_seconds() / 60.0 for value in bars.values()), 2),
         "stage": state["stage"],
+        "phase_target": STAGES[state["stage"]]["target"],
+        "completed_phases": len(state.get("phase_history", [])),
         "balance": state["balance"],
         "open_positions": len(state["positions"]),
         "pending_entries": len(state["pending"]),
@@ -742,6 +819,9 @@ def print_saved_status(state, state_dir):
 def cycle(args, state, state_path, mt5, strategies, symbol_map):
     events_to_process = []
     latest_bars = {}
+    live_prices = current_tick_prices(mt5, symbol_map, state.get("last_prices", {}))
+    state["last_prices"].update(live_prices)
+    enforce_controls(state, live_prices, pd.Timestamp.now(tz="UTC"))
     symbol_order = {symbol: index for index, symbol in enumerate(symbol_map)}
     for symbol, broker_symbol in symbol_map.items():
         features = get_features(mt5, broker_symbol, args.state_dir, symbol)
@@ -767,17 +847,22 @@ def cycle(args, state, state_path, mt5, strategies, symbol_map):
             events_to_process.append((pd.Timestamp(bar.timestamp), symbol_order[symbol], symbol, broker_symbol, bar))
 
     ordered_events = sorted(events_to_process, key=lambda item: (item[0], item[1]))
+    transition_timestamp = None
     for index, (timestamp, _, symbol, broker_symbol, bar) in enumerate(ordered_events):
         state["last_prices"][symbol] = float(bar.close)
         refresh_day(state, bar.timestamp, bar_processing_mode(bar.timestamp))
         manage_positions(state, bar, symbol)
-        process_pending(state, bar, symbol, mt5, broker_symbol)
-        symbol_strategies = strategies[strategies["symbol"] == symbol]
-        find_signals(state, bar, symbol_strategies, symbol)
+        if enforce_controls(state, state["last_prices"], bar.timestamp):
+            transition_timestamp = timestamp
+        if transition_timestamp != timestamp and not state["locked"]:
+            process_pending(state, bar, symbol, mt5, broker_symbol)
+            symbol_strategies = strategies[strategies["symbol"] == symbol]
+            find_signals(state, bar, symbol_strategies, symbol)
         state["last_bar_times"][symbol] = bar.timestamp.isoformat()
         next_timestamp = ordered_events[index + 1][0] if index + 1 < len(ordered_events) else None
         if next_timestamp != timestamp:
-            enforce_controls(state, state["last_prices"], bar.timestamp)
+            if enforce_controls(state, state["last_prices"], bar.timestamp):
+                transition_timestamp = timestamp
 
     if "GBPUSD" in state["last_bar_times"]:
         state["last_bar_time"] = state["last_bar_times"]["GBPUSD"]
@@ -789,6 +874,44 @@ def cycle(args, state, state_path, mt5, strategies, symbol_map):
     if maybe_send_daily_email(state, args.state_dir, newest_bar):
         atomic_json(state, state_path)
     print(f"status symbols={','.join(symbol_map)} stage={state['stage']} balance={state['balance']:.2f} equity={equity(state, state['last_prices']):.2f} open={len(state['positions'])} pending={len(state['pending'])} days={len(state['trading_days'])} locked={state['locked']}", flush=True)
+
+
+def wait_with_live_controls(args, state, state_path, mt5, symbol_map):
+    """Check account controls every five seconds between full strategy scans."""
+    deadline = time.monotonic() + max(int(args.interval), 5)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(5.0, remaining))
+        before = (
+            state["stage"], float(state["balance"]), len(state["positions"]),
+            len(state["pending"]), bool(state["locked"]), state.get("lock_reason"),
+            len(state.get("events", [])),
+        )
+        live_prices = current_tick_prices(mt5, symbol_map, state.get("last_prices", {}))
+        state["last_prices"].update(live_prices)
+        enforce_controls(state, live_prices, pd.Timestamp.now(tz="UTC"))
+        after = (
+            state["stage"], float(state["balance"]), len(state["positions"]),
+            len(state["pending"]), bool(state["locked"]), state.get("lock_reason"),
+            len(state.get("events", [])),
+        )
+        if after != before:
+            atomic_json(state, state_path)
+            latest_bars = {
+                symbol: timestamp
+                for symbol, timestamp in state.get("last_bar_times", {}).items()
+                if symbol in symbol_map and timestamp
+            }
+            if latest_bars:
+                write_health(args.state_dir, state, latest_bars)
+            print(
+                f"live-control stage={state['stage']} balance={state['balance']:.2f} "
+                f"equity={equity(state, live_prices):.2f} open={len(state['positions'])} "
+                f"pending={len(state['pending'])} locked={state['locked']}",
+                flush=True,
+            )
 
 
 def self_test():
@@ -803,6 +926,38 @@ def self_test():
     assert not risk_allowed(s, 1.25)[0]
     s["stage"] = "QUALIFIED"
     assert math.isclose(STAGES[s["stage"]]["risk"], .005)
+    passed = initial_state()
+    passed["balance"] = 11100.0
+    passed["day_start_balance"] = 10000.0
+    passed["locked"] = True
+    passed["lock_reason"] = "PHASE_TARGET"
+    passed["pending"] = [{"strategy": "OLD_PHASE_PENDING"}]
+    changed = enforce_controls(passed, {}, pd.Timestamp("2026-01-05T09:00:00Z"))
+    assert changed
+    assert passed["stage"] == "PHASE_2"
+    assert math.isclose(passed["balance"], PHASE_START_BALANCE)
+    assert not passed["locked"] and not passed["pending"]
+    assert passed["phase_history"][-1]["target"] == 11030.0
+    assert passed["phase_history"][-1]["actual_close_balance"] == 11100.0
+    floating_pass = initial_state()
+    floating_pass["balance"] = 10950.0
+    floating_pass["positions"] = [{
+        "symbol": "GBPUSD", "strategy": "GBPUSD|TARGET_TEST", "direction": "BUY",
+        "entry": 1.0, "sl": 0.99, "tp": 1.10, "risk_distance": 0.01,
+        "risk_dollars": 100.0, "entry_bar_time": "2026-01-05T08:00:00+00:00",
+        "processing_mode": "LIVE",
+    }]
+    assert enforce_controls(
+        floating_pass, {"GBPUSD": 1.008}, pd.Timestamp("2026-01-05T09:00:00Z")
+    )
+    assert floating_pass["stage"] == "PHASE_2" and not floating_pass["positions"]
+    assert math.isclose(floating_pass["phase_history"][-1]["actual_close_balance"], 11030.0)
+    phase_two = initial_state()
+    phase_two["stage"] = "PHASE_2"
+    phase_two["balance"] = 10520.0
+    assert enforce_controls(phase_two, {}, pd.Timestamp("2026-01-06T09:00:00Z"))
+    assert phase_two["stage"] == "QUALIFIED"
+    assert math.isclose(phase_two["balance"], PHASE_START_BALANCE)
     s = initial_state()
     signal_time = pd.Timestamp("2026-01-05T09:00:00Z")
     s["pending"] = [{
@@ -861,7 +1016,7 @@ def self_test():
             assert json.loads((folder / "health.json").read_text(encoding="utf-8"))["open_positions"] == 0
         finally:
             globals()["get_features"] = original_get_features
-    print("SELF-TEST PASSED: risk, timestamp entries, daily reset, and state controls")
+    print("SELF-TEST PASSED: risk, automatic phase transition, timestamp entries, daily reset, and state controls")
 
 
 def main():
@@ -910,7 +1065,7 @@ def main():
             cycle(args, state, state_path, mt5, strategies, symbol_map)
             if args.once:
                 break
-            time.sleep(max(args.interval, 5))
+            wait_with_live_controls(args, state, state_path, mt5, symbol_map)
     finally:
         mt5.shutdown()
     return 0
