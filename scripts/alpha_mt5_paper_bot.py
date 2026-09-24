@@ -821,7 +821,15 @@ def cycle(args, state, state_path, mt5, strategies, symbol_map):
     latest_bars = {}
     live_prices = current_tick_prices(mt5, symbol_map, state.get("last_prices", {}))
     state["last_prices"].update(live_prices)
-    enforce_controls(state, live_prices, pd.Timestamp.now(tz="UTC"))
+    if enforce_controls(state, live_prices, pd.Timestamp.now(tz="UTC")):
+        atomic_json(state, state_path)
+        saved_bars = {
+            symbol: timestamp
+            for symbol, timestamp in state.get("last_bar_times", {}).items()
+            if symbol in symbol_map and timestamp
+        }
+        if saved_bars:
+            write_health(args.state_dir, state, saved_bars)
     symbol_order = {symbol: index for index, symbol in enumerate(symbol_map)}
     for symbol, broker_symbol in symbol_map.items():
         features = get_features(mt5, broker_symbol, args.state_dir, symbol)
