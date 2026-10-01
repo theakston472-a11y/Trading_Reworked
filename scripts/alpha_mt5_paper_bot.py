@@ -578,6 +578,11 @@ def manage_positions(state, bar, symbol):
 
 
 def enforce_controls(state, prices, timestamp):
+    # A daily or hard-loss lock remains active until its dedicated reset.
+    # Re-evaluating the same breached threshold used to append and email a
+    # fresh lock event on every five-second live-price check.
+    if state.get("locked") and state.get("lock_reason") != "PHASE_TARGET":
+        return False
     stage = STAGES[state["stage"]]
     current_equity = equity(state, prices)
 
@@ -934,6 +939,13 @@ def self_test():
     assert not risk_allowed(s, 1.25)[0]
     s["stage"] = "QUALIFIED"
     assert math.isclose(STAGES[s["stage"]]["risk"], .005)
+    daily_locked = initial_state()
+    daily_locked["broker_day"] = "2026-01-05"
+    daily_locked["balance"] = 9699.0
+    enforce_controls(daily_locked, {}, pd.Timestamp("2026-01-05T09:00:00Z"))
+    enforce_controls(daily_locked, {}, pd.Timestamp("2026-01-05T09:00:05Z"))
+    assert daily_locked["locked"] and daily_locked["lock_reason"] == "DAILY_LIMIT"
+    assert sum(item["kind"] == "DAILY_LOCK" for item in daily_locked["events"]) == 1
     passed = initial_state()
     passed["balance"] = 11100.0
     passed["day_start_balance"] = 10000.0
