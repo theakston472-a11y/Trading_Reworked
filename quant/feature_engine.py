@@ -1,8 +1,9 @@
 import pandas as pd
 import numpy as np
 from quant.institutional_features import add_institutional_features
+from quant.smc_guide_features import add_smc_guide_features
 
-FEATURE_ENGINE_VERSION = "2026-08-16-v8-bos-fib-sequence"
+FEATURE_ENGINE_VERSION = "2026-10-10-v10-smc-guide-expansion"
 
 
 def build_features(input_file):
@@ -1833,6 +1834,17 @@ def build_features(input_file):
     df["bullish_smc_fvg_high"] = bull_setup_fvg_high
     df["bearish_smc_fvg_low"] = bear_setup_fvg_low
     df["bearish_smc_fvg_high"] = bear_setup_fvg_high
+
+    # =========================================================
+    # EXTENDED SMC GUIDE FEATURES
+    # =========================================================
+    # Public concept definitions implemented independently from the
+    # commercial indicator: internal/swing structure, strong/weak
+    # liquidity, IFVG/Implied-FVG/BPR, voids, opening gaps, OTE,
+    # higher-timeframe state and timed kill-zone setups.
+
+    print("Adding extended SMC guide features...")
+    df = add_smc_guide_features(df)
 
     return df
 

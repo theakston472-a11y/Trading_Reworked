@@ -7,7 +7,7 @@ import numpy as np
 
 from quant.backtester import backtest_strategy
 
-EXPANDED_SEARCH_ENGINE_VERSION = "2026-08-14-v5-smc-sequences"
+EXPANDED_SEARCH_ENGINE_VERSION = "2026-10-10-v10-smc-guide-expansion"
 
 
 # ============================================================
@@ -94,6 +94,43 @@ SESSIONS = [
 
 BUY_FEATURES = [
 
+    # Extended public SMC guide concepts
+    "internal_swing_bullish_alignment",
+    "swing_bullish_bos",
+    "swing_bullish_choch",
+    "sell_side_liquidity_sweep",
+    "near_sell_side_liquidity",
+    "strong_low",
+    "weak_high",
+    "bullish_inverse_fvg_retest",
+    "bullish_implied_fvg_retest",
+    "bullish_bpr",
+    "bullish_bpr_retest",
+    "bullish_liquidity_void_bms",
+    "bullish_opening_gap_retest",
+    "bullish_internal_order_block_retest",
+    "bullish_internal_breaker_retest",
+    "bullish_swing_order_block_retest",
+    "bullish_swing_breaker_retest",
+    "discount_zone",
+    "bullish_ote",
+    "h1_bullish_trend",
+    "h1_bullish_fvg",
+    "h1_bullish_implied_fvg",
+    "h1_bullish_inverse_fvg",
+    "h1_bullish_bpr",
+    "h4_bullish_trend",
+    "h4_bullish_fvg",
+    "h4_bullish_implied_fvg",
+    "h4_bullish_inverse_fvg",
+    "h4_bullish_bpr",
+    "current_day_low_sweep",
+    "previous_week_low_sweep",
+    "previous_month_low_sweep",
+    "bullish_smc_confluence",
+    "bullish_kill_zone_setup",
+    "bullish_silver_bullet_setup",
+
     # Trend / structure
     "ema_bullish_alignment",
     "bullish_bos",
@@ -151,6 +188,43 @@ BUY_FEATURES = [
 
 
 SELL_FEATURES = [
+
+    # Extended public SMC guide concepts
+    "internal_swing_bearish_alignment",
+    "swing_bearish_bos",
+    "swing_bearish_choch",
+    "buy_side_liquidity_sweep",
+    "near_buy_side_liquidity",
+    "strong_high",
+    "weak_low",
+    "bearish_inverse_fvg_retest",
+    "bearish_implied_fvg_retest",
+    "bearish_bpr",
+    "bearish_bpr_retest",
+    "bearish_liquidity_void_bms",
+    "bearish_opening_gap_retest",
+    "bearish_internal_order_block_retest",
+    "bearish_internal_breaker_retest",
+    "bearish_swing_order_block_retest",
+    "bearish_swing_breaker_retest",
+    "premium_zone",
+    "bearish_ote",
+    "h1_bearish_trend",
+    "h1_bearish_fvg",
+    "h1_bearish_implied_fvg",
+    "h1_bearish_inverse_fvg",
+    "h1_bearish_bpr",
+    "h4_bearish_trend",
+    "h4_bearish_fvg",
+    "h4_bearish_implied_fvg",
+    "h4_bearish_inverse_fvg",
+    "h4_bearish_bpr",
+    "current_day_high_sweep",
+    "previous_week_high_sweep",
+    "previous_month_high_sweep",
+    "bearish_smc_confluence",
+    "bearish_kill_zone_setup",
+    "bearish_silver_bullet_setup",
 
     # Trend / structure
     "ema_bearish_alignment",

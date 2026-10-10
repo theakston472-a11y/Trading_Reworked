@@ -45,7 +45,7 @@ import pandas as pd
 # Increment this whenever signal/execution logic changes.
 # It is included in SQLite cache keys so corrected backtests never
 # silently reuse results produced by older logic.
-BACKTEST_ENGINE_VERSION = "2026-08-16-v9-directional-fib-gate"
+BACKTEST_ENGINE_VERSION = "2026-10-10-v10-smc-guide-expansion"
 
 
 # ============================================================
