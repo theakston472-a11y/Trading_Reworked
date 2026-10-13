@@ -233,6 +233,7 @@ def discovery_features_for_direction(direction):
 DEFAULT_MAX_CONDITIONS = 4
 DEFAULT_MIN_TRADES = 20
 DEFAULT_MAX_NEW = 5000
+DEFAULT_MAX_EXAMINED = 0
 DEFAULT_RR = 2.0
 DEFAULT_MAX_OPEN = 5
 DEFAULT_MAX_BARS = 48
@@ -302,7 +303,14 @@ def parse_args():
         "--max-new",
         type=int,
         default=DEFAULT_MAX_NEW,
-        help="Maximum NEW combinations to test this run",
+        help="Maximum candidates to save this run",
+    )
+
+    parser.add_argument(
+        "--max-examined",
+        type=int,
+        default=DEFAULT_MAX_EXAMINED,
+        help="Optional ceiling on newly tested combinations; 0 means unlimited",
     )
 
     parser.add_argument(
@@ -1171,6 +1179,7 @@ def discover(
     max_conditions,
     min_trades,
     max_new,
+    max_examined,
     rr,
     max_open,
     max_bars,
@@ -1319,6 +1328,8 @@ def discover(
             features,
             condition_count,
         ):
+            if max_examined > 0 and examined >= max_examined:
+                break
             if added >= max_new:
                 break
 
@@ -1495,7 +1506,7 @@ def discover(
             rows.append(row)
             added += 1
 
-        if added >= max_new:
+        if added >= max_new or (max_examined > 0 and examined >= max_examined):
             break
 
     connection.commit()
@@ -1721,6 +1732,10 @@ def main():
     )
 
     print(
+        f"Max examined:    {args.max_examined if args.max_examined > 0 else 'unlimited'}"
+    )
+
+    print(
         f"Engine:          {DISCOVERY_ENGINE_VERSION}"
     )
 
@@ -1776,6 +1791,7 @@ def main():
             max_conditions=args.max_conditions,
             min_trades=args.min_trades,
             max_new=args.max_new,
+            max_examined=args.max_examined,
             rr=args.rr,
             max_open=args.max_open,
             max_bars=args.max_bars,

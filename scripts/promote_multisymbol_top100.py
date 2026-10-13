@@ -16,6 +16,7 @@ DIRECTIONS = ("BUY", "SELL")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--symbols", nargs="+", default=list(SYMBOLS))
     parser.add_argument("--per-direction", type=int, default=50)
     parser.add_argument("--session-cap", type=int, default=20)
     return parser.parse_args()
@@ -89,7 +90,8 @@ def main() -> int:
     promotion = run / "promotion"
     promotion.mkdir(parents=True, exist_ok=True)
 
-    for symbol in SYMBOLS:
+    symbols = tuple(str(symbol).upper().strip() for symbol in args.symbols)
+    for symbol in symbols:
         frames = []
         counts = []
         for session in SESSIONS:

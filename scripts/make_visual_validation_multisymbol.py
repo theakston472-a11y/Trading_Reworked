@@ -22,6 +22,7 @@ from finalize_multisymbol_research import family_key, locate_worker_databases
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render trade-validation charts for the multi-symbol finalists.")
     parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--feature-root", required=True, type=Path)
     return parser.parse_args()
 
 
@@ -85,16 +86,16 @@ def build_index(output_dir: Path, selected: pd.DataFrame, elapsed: float) -> Pat
         )
     page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GBPJPY + AUDUSD Final Strategy Validation</title>
+<title>SMC V10 Final Strategy Validation</title>
 <style>
 body{{background:#080b10;color:#e8edf4;font:16px/1.45 Arial,sans-serif;margin:0;padding:32px}}
 .wrap{{max-width:1400px;margin:auto}}h1{{margin-top:0}}p{{color:#aeb8c5}}
 table{{width:100%;border-collapse:collapse;background:#111722}}th,td{{padding:12px;border:1px solid #263142;text-align:left}}
 th{{background:#182131;color:#8fdcff}}a{{color:#5fd3ff}}.note{{padding:16px;background:#101924;border-left:4px solid #5fd3ff;margin:20px 0}}
 </style></head><body><div class="wrap">
-<h1>GBPJPY + AUDUSD Final Strategy Validation</h1>
+<h1>SMC V10 Final Strategy Validation</h1>
 <p>Four trade examples per finalist: two wins and two losses where available. Open either symbol to view the full black-background trade charts.</p>
-<div class="note">AUDUSD finalists pass the broader quality gate but not the strict 5R drawdown gate. They should remain research/paper candidates until separately approved for deployment.</div>
+<div class="note">These are research finalists only. No live or paper-bot strategy list was changed by this validation run.</div>
 <table><thead><tr><th>Rank</th><th>Symbol / report</th><th>Direction</th><th>Session</th><th>Conditions</th><th>RR</th><th>Trades</th><th>PF</th><th>Max DD</th><th>Tier</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
 <p>Chart generation time: {elapsed:.2f} seconds.</p>
@@ -107,14 +108,14 @@ th{{background:#182131;color:#8fdcff}}a{{color:#5fd3ff}}.note{{padding:16px;back
 def main() -> None:
     args = parse_args()
     run_dir = args.run_dir.resolve()
-    root = Path(__file__).resolve().parents[1]
-    final_dir = run_dir / "final"
-    selected = pd.read_csv(final_dir / "multisymbol_final_top4.csv")
+    feature_root = args.feature_root.resolve()
+    final_dir = run_dir / "final_v10"
+    selected = pd.read_csv(final_dir / "smc_v10_final_top4.csv")
     output_dir = final_dir / "visual_validation"
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
 
-    for symbol in ("GBPJPY", "AUDUSD"):
+    for symbol in selected["symbol"].drop_duplicates().tolist():
         strategies = selected[selected["symbol"].eq(symbol)].copy()
         if strategies.empty:
             continue
@@ -123,9 +124,11 @@ def main() -> None:
         top_file = symbol_output / f"{symbol.lower()}_top_strategies.csv"
         database = symbol_output / f"{symbol.lower()}_selected.sqlite"
         strategies.to_csv(top_file, index=False)
-        build_selected_database(run_dir / "deep" / symbol, strategies, database)
+        completed_dir = run_dir / "deep_completed" / symbol
+        symbol_dir = completed_dir if completed_dir.exists() else run_dir / "deep" / symbol
+        build_selected_database(symbol_dir, strategies, database)
 
-        visual.FEATURE_FILE = root / "quant" / "research_symbols" / symbol / "feature_database.csv"
+        visual.FEATURE_FILE = feature_root / symbol / "feature_database.csv"
         visual.TOP_FILE = top_file
         visual.DB_FILE = database
         visual.OUTPUT_DIR = symbol_output

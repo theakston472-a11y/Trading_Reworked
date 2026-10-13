@@ -3,12 +3,21 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$RunPath,
     [string]$PythonPath = "",
-    [int]$Workers = 4
+    [string]$FeatureRoot = "",
+    [string[]]$Symbols = @("GBPJPY", "AUDUSD"),
+    [int]$Workers = 4,
+    [int]$MaxParallel = 4,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
 $Root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $Run = [System.IO.Path]::GetFullPath($RunPath)
+$FeatureBase = if ([string]::IsNullOrWhiteSpace($FeatureRoot)) {
+    Join-Path $Root "quant\research_symbols"
+} else {
+    [System.IO.Path]::GetFullPath($FeatureRoot)
+}
 if ([string]::IsNullOrWhiteSpace($PythonPath)) {
     $PythonPath = Join-Path $Root ".venv\Scripts\python.exe"
 }
@@ -18,16 +27,51 @@ if (-not (Test-Path -LiteralPath $PythonPath)) {
 if ($Workers -lt 1) {
     throw "Workers must be at least 1."
 }
+if ($MaxParallel -lt 1) {
+    throw "MaxParallel must be at least 1."
+}
 
 $Deep = Join-Path $Run "deep"
 $Logs = Join-Path $Run "logs"
 New-Item -ItemType Directory -Force -Path $Deep, $Logs | Out-Null
 $TimingRows = New-Object System.Collections.Generic.List[object]
-$Symbols = @("GBPJPY", "AUDUSD")
 Set-Location $Root
 
+function Wait-DeepProcesses {
+    param([object[]]$Items)
+
+    foreach ($Item in $Items) {
+        $Item.Process.WaitForExit()
+        $Item.Process.Refresh()
+        $Finished = Get-Date
+        $Seconds = ($Finished - $Item.Started).TotalSeconds
+        $ExitCode = $Item.Process.ExitCode
+        $CompletedOk = (
+            (Test-Path -LiteralPath $Item.Final) -and
+            (Test-Path -LiteralPath $Item.TopFinal) -and
+            (Test-Path -LiteralPath $Item.Periods) -and
+            (Test-Path -LiteralPath $Item.Stdout) -and
+            (Select-String -LiteralPath $Item.Stdout -SimpleMatch "Unique strategies passing filters" -Quiet)
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$ExitCode) -and $CompletedOk) {
+            $ExitCode = 0
+        }
+        $TimingRows.Add([pscustomobject]@{
+            symbol = $Item.Symbol
+            worker = $Item.Worker
+            seconds = [math]::Round($Seconds, 3)
+            exit_code = $ExitCode
+            status = if ($CompletedOk) { "complete" } else { "failed" }
+        })
+        Write-Host "Finished $($Item.Name): exit $ExitCode, $([math]::Round($Seconds, 1)) seconds"
+        if (-not $CompletedOk -or $ExitCode -ne 0) {
+            throw "Deep test failed for $($Item.Name). See $Logs"
+        }
+    }
+}
+
 foreach ($Symbol in $Symbols) {
-    $Data = Join-Path $Root "quant\research_symbols\$Symbol\feature_database.csv"
+    $Data = Join-Path $FeatureBase "$Symbol\feature_database.csv"
     $Top100 = Join-Path $Run "promotion\$Symbol\top100_candidates.csv"
     if (-not (Test-Path -LiteralPath $Data)) { throw "Missing data: $Data" }
     if (-not (Test-Path -LiteralPath $Top100)) { throw "Missing Top 100: $Top100" }
@@ -89,9 +133,11 @@ foreach ($Symbol in $Symbols) {
             "--min-trades", "20",
             "--final-n", "25",
             "--entry-mode", "auto",
-            "--entry-wait-bars", "6",
-            "--force"
+            "--entry-wait-bars", "6"
         )
+        if ($Force) {
+            $Arguments += "--force"
+        }
         $Started = Get-Date
         $Process = Start-Process -FilePath $PythonPath -ArgumentList $Arguments `
             -WorkingDirectory $Root -RedirectStandardOutput $Stdout `
@@ -108,35 +154,14 @@ foreach ($Symbol in $Symbols) {
             Stdout = $Stdout
         }
         Write-Host "Started $Name (PID $($Process.Id))"
+        if ($Processes.Count -ge $MaxParallel) {
+            Wait-DeepProcesses -Items $Processes
+            $Processes = @()
+        }
     }
 
-    foreach ($Item in $Processes) {
-        $Item.Process.WaitForExit()
-        $Item.Process.Refresh()
-        $Finished = Get-Date
-        $Seconds = ($Finished - $Item.Started).TotalSeconds
-        $ExitCode = $Item.Process.ExitCode
-        $CompletedOk = (
-            (Test-Path -LiteralPath $Item.Final) -and
-            (Test-Path -LiteralPath $Item.TopFinal) -and
-            (Test-Path -LiteralPath $Item.Periods) -and
-            (Test-Path -LiteralPath $Item.Stdout) -and
-            (Select-String -LiteralPath $Item.Stdout -SimpleMatch "Unique strategies passing filters" -Quiet)
-        )
-        if ([string]::IsNullOrWhiteSpace([string]$ExitCode) -and $CompletedOk) {
-            $ExitCode = 0
-        }
-        $TimingRows.Add([pscustomobject]@{
-            symbol = $Item.Symbol
-            worker = $Item.Worker
-            seconds = [math]::Round($Seconds, 3)
-            exit_code = $ExitCode
-            status = if ($CompletedOk) { "complete" } else { "failed" }
-        })
-        Write-Host "Finished $($Item.Name): exit $ExitCode, $([math]::Round($Seconds, 1)) seconds"
-        if (-not $CompletedOk -or $ExitCode -ne 0) {
-            throw "Deep test failed for $($Item.Name). See $Logs"
-        }
+    if ($Processes.Count -gt 0) {
+        Wait-DeepProcesses -Items $Processes
     }
 }
 
