@@ -12,3 +12,4 @@ AUDUSD,AU01,SELL,Asia,above_ema20+bearish_bos_fib_618,4.9,auto,6,2026-08-16-v9-d
 GBPJPY,GJ03,SELL,Asia,above_ema20+above_ema200+above_ema50+bearish_fib_liquidity,3.5,auto,6,2026-08-16-v9-directional-fib-gate,59.65178017191287,new
 AUDUSD,AU02,BUY,London,bullish_bos+bullish_fvg,6.2,auto,6,2026-08-16-v9-directional-fib-gate,59.59894498045372,new
 GBPJPY,GJ04,SELL,Asia,above_ema200+bearish_fib_liquidity+liquidity_sweep_high,3.5,auto,6,2026-08-16-v9-directional-fib-gate,54.49253961744829,new
+GBPJPY,GJ05,BUY,New York,above_ema200+bullish_choch+new_york_kill_zone,3.0,auto,6,2026-10-10-v10-smc-guide-expansion,54.351740850685154,v10_strict
